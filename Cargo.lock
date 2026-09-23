@@ -1359,6 +1359,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-verification-stage"
+version = "4.4.0-alpha.5"
+dependencies = [
+ "bytes",
+ "crossbeam-channel",
+ "solana-clock",
+ "solana-entry",
+ "solana-hash",
+ "solana-runtime",
+]
+
+[[package]]
 name = "block2"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

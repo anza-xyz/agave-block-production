@@ -1,7 +1,7 @@
 use {
     agave_scheduler_bindings::{LEADER_READY, LEADER_STARTING, NOT_LEADER, ProgressMessage},
+    core::num::NonZeroUsize,
     solana_clock::Slot,
-    std::num::NonZeroUsize,
 };
 
 type ProgressReceiver = shaq::spsc::Consumer<ProgressMessage>;
@@ -18,6 +18,7 @@ pub(crate) enum SchedulerState {
     },
     LeaderReady {
         slot: Slot,
+        remaining_cost_units: u64,
     },
 }
 
@@ -42,6 +43,7 @@ impl SchedulerState {
                 },
                 LEADER_READY => Self::LeaderReady {
                     slot: progress.current_slot,
+                    remaining_cost_units: progress.remaining_cost_units,
                 },
                 state => panic!("unknown leader state: {state}"),
             };
@@ -64,7 +66,7 @@ mod tests {
             current_slot: 100,
             next_leader_slot: 104,
             leader_range_end: 107,
-            remaining_cost_units: 0,
+            remaining_cost_units: 123,
             remaining_allocated_accounts_data_size: 0,
             latest_blockhash: [0; 32],
             target_bank_time_ms: 0,
@@ -80,11 +82,23 @@ mod tests {
         producer.try_write(progress).unwrap();
 
         state.drain_progress(&mut consumer);
-        assert_eq!(state, SchedulerState::LeaderReady { slot: 100 });
+        assert_eq!(
+            state,
+            SchedulerState::LeaderReady {
+                slot: 100,
+                remaining_cost_units: 123,
+            }
+        );
         assert!(consumer.try_read().is_none());
 
         state.drain_progress(&mut consumer);
-        assert_eq!(state, SchedulerState::LeaderReady { slot: 100 });
+        assert_eq!(
+            state,
+            SchedulerState::LeaderReady {
+                slot: 100,
+                remaining_cost_units: 123,
+            }
+        );
 
         producer.try_write(progress).unwrap();
         producer.try_write(progress).unwrap();

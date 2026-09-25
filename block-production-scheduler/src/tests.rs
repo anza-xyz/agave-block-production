@@ -43,7 +43,10 @@ pub(super) fn setup(check_capacity: usize) -> (Scheduler, AgaveSession) {
     })
     .unwrap();
     let mut scheduler = Scheduler::new(client, 512);
-    scheduler.state = SchedulerState::LeaderReady { slot: 100 };
+    scheduler.state = SchedulerState::LeaderReady {
+        slot: 100,
+        remaining_cost_units: 0,
+    };
     (scheduler, agave)
 }
 

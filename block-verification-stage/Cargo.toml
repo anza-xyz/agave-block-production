@@ -1,0 +1,28 @@
+[package]
+name = "block-verification-stage"
+version = { workspace = true }
+authors = { workspace = true }
+description = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[dependencies]
+bytes.workspace = true
+crossbeam-channel.workspace = true
+mockall = { workspace = true, optional = true }
+solana-clock.workspace = true
+solana-entry.workspace = true
+solana-hash.workspace = true
+solana-runtime.workspace = true
+
+[dev-dependencies]
+block-verification-stage = { path = ".", features = ["dev-context-only-utils"] }
+
+[features]
+dev-context-only-utils = ["dep:mockall"]
+
+[lints]
+workspace = true

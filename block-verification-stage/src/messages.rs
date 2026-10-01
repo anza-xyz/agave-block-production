@@ -1,5 +1,7 @@
 use {
+    bytes::Bytes,
     solana_clock::{BankId, Slot},
+    solana_entry::entry::EntryView,
     solana_hash::Hash,
 };
 
@@ -13,6 +15,7 @@ pub enum BlockVerificationOutcome {
 #[derive(Debug)]
 pub(crate) enum ReplayToBlockVerificationMessage {
     Begin(BeginMessage),
+    Entry(EntryMessage),
     AllEntriesSubmitted(AllEntriesSubmittedMessage),
     Abort(AbortMessage),
 }
@@ -29,6 +32,12 @@ pub struct BlockVerificationToReplayMessage {
     pub slot: Slot,
     pub bank_id: BankId,
     pub verification_status: BlockVerificationOutcome,
+}
+
+#[derive(Debug)]
+pub(crate) struct EntryMessage {
+    pub(crate) bank_id: BankId,
+    pub(crate) entry_view: EntryView<Bytes>,
 }
 
 #[derive(Debug)]

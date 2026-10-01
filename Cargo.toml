@@ -9,6 +9,7 @@ members = [
     "banks-client",
     "banks-interface",
     "banks-server",
+    "block-verification-stage",
     "bloom",
     "bls-cert-verify",
     "bls-sigverify",

@@ -20,10 +20,10 @@ impl CostPacer {
         }
     }
 
-    /// Returns released cost units not already consumed or reserved for execution.
+    /// Returns the time-prorated budget minus cost already consumed or reserved.
     pub(crate) fn available_budget(&self, now: Instant, consumed_cost: u64) -> u64 {
         let elapsed = now.saturating_duration_since(self.slot_start);
-        let released = if elapsed >= self.fill_duration {
+        let prorated_budget = if elapsed >= self.fill_duration {
             self.budget
         } else {
             u128::from(self.budget)
@@ -31,7 +31,7 @@ impl CostPacer {
                 .checked_div(self.fill_duration.as_nanos())
                 .unwrap() as u64
         };
-        released.saturating_sub(consumed_cost)
+        prorated_budget.saturating_sub(consumed_cost)
     }
 }
 
@@ -40,7 +40,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn releases_budget_linearly_before_slot_end() {
+    fn available_budget_is_prorated_by_elapsed_time() {
         let start = Instant::now();
         let pacer = CostPacer::new(
             100,

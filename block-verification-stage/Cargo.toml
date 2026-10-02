@@ -11,10 +11,11 @@ edition = { workspace = true }
 rust-version = { workspace = true }
 
 [dependencies]
-bytes.workspace = true
-solana-clock.workspace = true
-solana-entry.workspace = true
-solana-hash.workspace = true
+bytes = { workspace = true }
+crossbeam-channel = { workspace = true }
+solana-clock = { workspace = true }
+solana-entry = { workspace = true }
+solana-hash = { workspace = true }
 
 [lints]
 workspace = true

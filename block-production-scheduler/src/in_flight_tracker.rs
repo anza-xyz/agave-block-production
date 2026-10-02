@@ -17,6 +17,8 @@ impl InFlightTracker {
         }
     }
 
+    /// # Panics
+    /// Panics if `worker` is outside the configured worker range.
     pub(crate) fn worker_load(&self, worker: usize) -> &WorkerLoad {
         &self.workers[worker]
     }
@@ -26,6 +28,9 @@ impl InFlightTracker {
     }
 
     /// Records a successfully published batch.
+    ///
+    /// # Panics
+    /// Panics if `worker` is outside the configured worker range.
     pub(crate) fn track_batch(&mut self, worker: usize, transactions: usize, cost_units: u64) {
         let load = &mut self.workers[worker];
         load.batches = load.batches.wrapping_add(1);
@@ -35,6 +40,10 @@ impl InFlightTracker {
 
     /// Removes a completed batch using its original transaction count and estimated cost,
     /// including when execution failed. Actual costs belong in the slot's cost tracker.
+    ///
+    /// # Panics
+    /// Panics if `worker` is outside the configured worker range. In debug builds, also panics
+    /// if no batch is outstanding or the completed transaction count or cost exceeds the load.
     pub(crate) fn complete_batch(&mut self, worker: usize, transactions: usize, cost_units: u64) {
         let load = &mut self.workers[worker];
         debug_assert!(load.batches > 0);

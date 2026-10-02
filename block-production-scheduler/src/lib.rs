@@ -3,7 +3,8 @@
 
 use {
     crate::{
-        check_response::TransactionState, progress_tracker::SchedulerState,
+        check_response::TransactionState, in_flight_tracker::InFlightTracker,
+        progress_tracker::SchedulerState, schedule::SchedulerScratch,
         transaction_container::TransactionContainer,
     },
     agave_reserved_account_keys::ReservedAccountKeys,
@@ -13,7 +14,9 @@ use {
     agave_scheduler_handshake::{
         ClientHandshakeError, ClientLogon, ClientSession, ClientWorkerSession, client,
     },
-    agave_scheduling_utils::cost_pacer::CostPacer,
+    agave_scheduling_utils::{
+        cost_pacer::CostPacer, thread_aware_account_locks::ThreadAwareAccountLocks,
+    },
     core::{
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,
@@ -25,16 +28,11 @@ use {
 };
 
 mod check_response;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by upcoming execution dispatch and response handling"
-    )
-)]
+mod execution_response;
 mod in_flight_tracker;
 mod progress_tracker;
 mod resolved_transaction;
+mod schedule;
 mod tpu_ingress;
 #[cfg_attr(
     not(test),
@@ -69,6 +67,13 @@ pub struct Config {
     pub progress_tracker_capacity: usize,
     /// Minimum scheduler-to-execution-worker queue capacity in messages.
     pub pack_to_worker_capacity: usize,
+    /// Outstanding estimated CU target per worker, including pending batches.
+    /// The last assigned transaction may cross this target.
+    pub max_cost_units_per_worker: u64,
+    /// Estimated CU target per execution batch, checked after adding each transaction.
+    pub max_cost_units_per_batch: u64,
+    /// Target serialized entry bytes per execution batch, including entry overhead.
+    pub target_entry_bytes_per_batch: u64,
     /// Minimum execution-worker-to-scheduler queue capacity in messages.
     pub worker_to_pack_capacity: usize,
     /// Minimum scheduler-to-check-worker queue capacity in messages.
@@ -81,14 +86,14 @@ pub struct Config {
     pub execution_margin: Duration,
 }
 
-#[expect(
-    dead_code,
-    reason = "resources retained for the scheduler loop implementation"
-)]
 struct Scheduler {
     state: SchedulerState,
     scheduling_slot: Option<Slot>,
     cost_pacer: Option<CostPacer>,
+    /// Estimated CUs dispatched in the current scheduling slot, used for pacing.
+    scheduled_cost: u64,
+    /// Transactions held out of the priority queue until the next scheduling slot.
+    deferred_execution: Vec<usize>,
     execution_margin: Duration,
     allocator: Allocator,
     tpu_receiver: shaq::spsc::Consumer<TpuToPackMessage>,
@@ -96,9 +101,15 @@ struct Scheduler {
     check_sender: shaq::mpmc::Producer<PackToCheckWorkerMessage>,
     outstanding_check_packets: usize,
     transactions: TransactionContainer<TransactionState>,
+    scheduling_scratch: SchedulerScratch,
     reserved_account_keys: HashSet<Pubkey, PubkeyHasherBuilder>,
     check_receiver: shaq::mpmc::Consumer<CheckWorkerToPackMessage>,
     workers: Vec<ClientWorkerSession>,
+    in_flight: InFlightTracker,
+    account_locks: ThreadAwareAccountLocks,
+    max_cost_units_per_worker: u64,
+    max_cost_units_per_batch: u64,
+    target_entry_bytes_per_batch: u64,
 }
 
 impl Scheduler {
@@ -106,6 +117,9 @@ impl Scheduler {
         session: ClientSession,
         transaction_state_capacity: usize,
         execution_margin: Duration,
+        max_cost_units_per_worker: u64,
+        max_cost_units_per_batch: u64,
+        target_entry_bytes_per_batch: u64,
     ) -> Self {
         let ClientSession {
             allocator,
@@ -120,6 +134,8 @@ impl Scheduler {
             state: SchedulerState::new(),
             scheduling_slot: None,
             cost_pacer: None,
+            scheduled_cost: 0,
+            deferred_execution: Vec::with_capacity(transaction_state_capacity),
             execution_margin,
             allocator,
             tpu_receiver: tpu_to_pack,
@@ -127,17 +143,26 @@ impl Scheduler {
             check_sender: pack_to_check_worker,
             outstanding_check_packets: 0,
             transactions: TransactionContainer::with_capacity(transaction_state_capacity),
+            scheduling_scratch: SchedulerScratch::new(transaction_state_capacity),
             reserved_account_keys: ReservedAccountKeys::default().active.into_iter().collect(),
             check_receiver: check_worker_to_pack,
+            in_flight: InFlightTracker::new(workers.len()),
+            account_locks: ThreadAwareAccountLocks::new(workers.len()),
+            max_cost_units_per_worker,
+            max_cost_units_per_batch,
+            target_entry_bytes_per_batch,
             workers,
         }
     }
 
     fn run_iteration(&mut self) {
         self.handle_leader_progress();
+        self.handle_execution_worker_responses();
         self.handle_slot_change();
         self.handle_check_worker_responses();
         self.handle_tpu_ingress();
+        let budget = self.pacing_budget(Instant::now(), self.scheduled_cost);
+        self.schedule(budget);
         core::hint::spin_loop();
     }
 
@@ -157,11 +182,15 @@ impl Scheduler {
         };
         // Seed the slot once. Later snapshots can include our own reservations and must not
         // replace the initial pacing budget.
-        if self.scheduling_slot == Some(slot) {
+        if self.scheduling_slot == Some(slot) || !self.in_flight.is_empty() {
             return;
         }
 
         self.scheduling_slot = Some(slot);
+        self.scheduled_cost = 0;
+        for id in self.deferred_execution.drain(..) {
+            self.transactions.requeue(id);
+        }
         self.cost_pacer = Some(CostPacer::new(
             remaining_cost_units,
             slot_start,
@@ -169,10 +198,6 @@ impl Scheduler {
         ));
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by upcoming execution dispatch")
-    )]
     fn pacing_budget(&self, now: Instant, consumed_cost: u64) -> u64 {
         if !matches!(self.state, SchedulerState::LeaderReady { slot, .. } if self.scheduling_slot == Some(slot))
         {
@@ -214,6 +239,9 @@ pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError
         client::connect(config.ipc_path, logon, config.handshake_timeout)?,
         config.transaction_state_capacity,
         config.execution_margin,
+        config.max_cost_units_per_worker,
+        config.max_cost_units_per_batch,
+        config.target_entry_bytes_per_batch,
     );
 
     while !exit.load(Ordering::Relaxed) {

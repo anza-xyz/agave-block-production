@@ -155,12 +155,12 @@ impl Scheduler {
         else {
             return;
         };
+        // Seed the slot once. Later snapshots can include our own reservations and must not
+        // replace the initial pacing budget.
         if self.scheduling_slot == Some(slot) {
             return;
         }
 
-        // Seed the slot once. Later snapshots can include our own reservations and must not
-        // replace the initial pacing budget.
         self.scheduling_slot = Some(slot);
         self.cost_pacer = Some(CostPacer::new(
             remaining_cost_units,

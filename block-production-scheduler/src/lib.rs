@@ -3,7 +3,7 @@
 
 use {
     crate::{
-        check_response::TransactionState, cost_pacer::CostPacer, progress_tracker::SchedulerState,
+        check_response::TransactionState, progress_tracker::SchedulerState,
         transaction_container::TransactionContainer,
     },
     agave_reserved_account_keys::ReservedAccountKeys,
@@ -13,6 +13,7 @@ use {
     agave_scheduler_handshake::{
         ClientHandshakeError, ClientLogon, ClientSession, ClientWorkerSession, client,
     },
+    agave_scheduling_utils::cost_pacer::CostPacer,
     core::{
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,
@@ -24,7 +25,6 @@ use {
 };
 
 mod check_response;
-mod cost_pacer;
 #[cfg_attr(
     not(test),
     expect(
@@ -165,8 +165,7 @@ impl Scheduler {
         self.cost_pacer = Some(CostPacer::new(
             remaining_cost_units,
             slot_start,
-            slot_duration,
-            self.execution_margin,
+            slot_duration.saturating_sub(self.execution_margin),
         ));
     }
 

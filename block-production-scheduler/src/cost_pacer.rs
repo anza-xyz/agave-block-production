@@ -66,6 +66,10 @@ mod tests {
             100
         );
         assert_eq!(
+            pacer.available_budget(start + Duration::from_millis(500), 0),
+            100
+        );
+        assert_eq!(
             pacer.available_budget(start + Duration::from_millis(500), 100),
             0
         );

@@ -38,16 +38,19 @@
 //! ```
 
 use {
-    crate::messages::{
-        AbortMessage, AllEntriesSubmittedMessage, BeginMessage, BlockVerificationToReplayMessage,
-        EntryMessage, ReplayToBlockVerificationMessage,
+    crate::{
+        messages::{
+            AbortMessage, AllEntriesSubmittedMessage, BeginMessage,
+            BlockVerificationToReplayMessage, EntryMessage, ReplayToBlockVerificationMessage,
+        },
+        scheduler::SchedulerExitReason,
     },
     bytes::Bytes,
     crossbeam_channel::{Receiver, SendError, Sender},
     solana_clock::{BankId, Slot},
     solana_entry::entry::EntryView,
     solana_hash::Hash,
-    std::{marker::PhantomData, thread::JoinHandle},
+    std::{marker::PhantomData, panic::resume_unwind, thread::JoinHandle},
 };
 
 /// A type-state used over [`BlockVerificationSession<Started>`] representing the state
@@ -96,18 +99,14 @@ impl AbortBlockVerification for AllEntriesSubmitted {}
 pub struct BlockVerificationStage {
     replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
     replay_message_receiver: Receiver<BlockVerificationToReplayMessage>,
-    scheduler_thread_join_handle: JoinHandle<()>,
+    scheduler_thread_join_handle: JoinHandle<Result<(), SchedulerExitReason>>,
 }
 
 impl BlockVerificationStage {
-    #[expect(
-        dead_code,
-        reason = "the stage is constructed by the scheduler in a follow-up"
-    )]
     pub(crate) fn new(
         replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
         replay_message_receiver: Receiver<BlockVerificationToReplayMessage>,
-        scheduler_thread_join_handle: JoinHandle<()>,
+        scheduler_thread_join_handle: JoinHandle<Result<(), SchedulerExitReason>>,
     ) -> Self {
         Self {
             replay_message_sender,
@@ -124,8 +123,12 @@ impl BlockVerificationStage {
     }
 
     /// Waits for the scheduler thread to exit
-    pub fn join(self) -> std::thread::Result<()> {
-        self.scheduler_thread_join_handle.join()
+    pub fn join(self) -> Result<(), SchedulerExitReason> {
+        match self.scheduler_thread_join_handle.join() {
+            Ok(exit_reason) => exit_reason,
+            // propagate panic
+            Err(error) => resume_unwind(error),
+        }
     }
 
     /// Starts verifying the block for `bank_id` at `slot`, returning a session to submit its

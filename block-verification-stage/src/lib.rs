@@ -1,8 +1,15 @@
-pub use stage::BlockVerificationStage;
+use std::sync::{Arc, atomic::AtomicBool};
+pub use {config::SchedulerConfig, stage::BlockVerificationStage};
 
-#[expect(
-    dead_code,
-    reason = "the messages are handled by the scheduler in a follow-up"
-)]
+mod config;
+mod scheduler;
+
 pub mod messages;
 pub mod stage;
+
+pub fn run_scheduler(
+    scheduler_config: SchedulerConfig,
+    shutdown_signal: Arc<AtomicBool>,
+) -> BlockVerificationStage {
+    scheduler::BlockVerificationScheduler::run_scheduler(scheduler_config, shutdown_signal)
+}

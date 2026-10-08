@@ -35,6 +35,7 @@ pub struct BlockVerificationToReplayMessage {
 }
 
 #[derive(Debug)]
+#[expect(dead_code, reason = "handling entries will be added in follow up")]
 pub(crate) struct EntryMessage {
     pub(crate) bank_id: BankId,
     pub(crate) entry_view: EntryView<Bytes>,

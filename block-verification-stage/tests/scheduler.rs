@@ -4,7 +4,7 @@ use {
         messages::{BlockVerificationOutcome, BlockVerificationToReplayMessage},
         run_scheduler,
         stage::{
-            Aborted, AllEntriesSubmitted, BlockVerificationSession, SchedulerShutdownError, Started,
+            Aborted, AllEntriesSubmitted, BlockVerificationSession, SchedulerSendError, Started,
         },
     },
     crossbeam_channel::RecvTimeoutError,
@@ -272,6 +272,6 @@ fn shutdown_stops_scheduler_with_block_in_progress() {
 
     assert_matches!(
         session.notify_all_entries_submitted(),
-        Err(SchedulerShutdownError)
+        Err(SchedulerSendError::SchedulerShutdown(_))
     );
 }

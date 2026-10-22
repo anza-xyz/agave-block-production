@@ -33,8 +33,6 @@
 //!     Aborted                        ──► aborted before verification finished
 //!   An abort arriving after the outcome was sent is ignored.
 //!
-//!   Every transition fails with an error if the scheduler has shut down.
-//!
 //! ```
 
 use {
@@ -46,7 +44,7 @@ use {
         scheduler::SchedulerExitReason,
     },
     bytes::Bytes,
-    crossbeam_channel::{Receiver, SendError, Sender},
+    crossbeam_channel::{Receiver, Sender, TrySendError},
     solana_clock::{BankId, Slot},
     solana_entry::entry::EntryView,
     solana_hash::Hash,
@@ -134,8 +132,7 @@ impl BlockVerificationStage {
     /// Starts verifying the block for `bank_id` at `slot`, returning a session to submit its
     /// entries to.
     ///
-    /// Fails if the scheduler has shut down. The outcome of the block is sent on
-    /// [`BlockVerificationStage::scheduler_message_receiver`].
+    /// The outcome of the block is sent on [`BlockVerificationStage::scheduler_message_receiver`].
     ///
     /// ### NB!
     /// `bank_id` and `slot` must not be used by another block before its outcome is received, even
@@ -145,7 +142,7 @@ impl BlockVerificationStage {
         bank_id: BankId,
         slot: Slot,
         parent_bank_last_entry_hash: Hash,
-    ) -> Result<BlockVerificationSession<Started>, SchedulerShutdownError> {
+    ) -> Result<BlockVerificationSession<Started>, SchedulerSendError<()>> {
         BlockVerificationSession::try_new(
             bank_id,
             slot,
@@ -174,10 +171,12 @@ where
     /// Aborts verification of the block.
     pub fn abort_block_verification(
         self,
-    ) -> Result<BlockVerificationSession<Aborted>, SchedulerShutdownError> {
-        self.send(ReplayToBlockVerificationMessage::Abort(AbortMessage {
+    ) -> Result<BlockVerificationSession<Aborted>, SchedulerSendError<Self>> {
+        if let Err(error) = self.send(ReplayToBlockVerificationMessage::Abort(AbortMessage {
             bank_id: self.bank_id,
-        }))?;
+        })) {
+            return Err(map_send_error(error, |_message| self));
+        }
 
         Ok(BlockVerificationSession::<Aborted> {
             bank_id: self.bank_id,
@@ -191,10 +190,8 @@ impl<SchedulingState> BlockVerificationSession<SchedulingState> {
     fn send(
         &self,
         message: ReplayToBlockVerificationMessage,
-    ) -> Result<(), SchedulerShutdownError> {
-        self.replay_message_sender
-            .send(message)
-            .map_err(|_err: SendError<_>| SchedulerShutdownError)
+    ) -> Result<(), TrySendError<ReplayToBlockVerificationMessage>> {
+        self.replay_message_sender.try_send(message)
     }
 }
 
@@ -204,7 +201,7 @@ impl BlockVerificationSession<Started> {
         slot: Slot,
         parent_bank_last_entry_hash: Hash,
         replay_message_sender: Sender<ReplayToBlockVerificationMessage>,
-    ) -> Result<Self, SchedulerShutdownError> {
+    ) -> Result<Self, SchedulerSendError<()>> {
         let begin_message = ReplayToBlockVerificationMessage::Begin(BeginMessage {
             bank_id,
             parent_bank_last_entry_hash,
@@ -217,27 +214,44 @@ impl BlockVerificationSession<Started> {
             scheduling_state: PhantomData,
         };
 
-        session.send(begin_message)?;
+        session
+            .send(begin_message)
+            .map_err(|error| map_send_error(error, drop))?;
 
         Ok(session)
     }
 
-    pub fn submit_entry(&self, entry_view: EntryView<Bytes>) -> Result<(), SchedulerShutdownError> {
+    pub fn submit_entry(
+        &self,
+        entry_view: EntryView<Bytes>,
+    ) -> Result<(), SchedulerSendError<EntryView<Bytes>>> {
         self.send(ReplayToBlockVerificationMessage::Entry(EntryMessage {
             bank_id: self.bank_id,
             entry_view,
         }))
+        .map_err(|error| {
+            map_send_error(error, |message| {
+                let ReplayToBlockVerificationMessage::Entry(EntryMessage { entry_view, .. }) =
+                    message
+                else {
+                    unreachable!("the rejected message is the EntryMessage constructed above");
+                };
+                entry_view
+            })
+        })
     }
 
     /// Tells the scheduler that every entry of the block has been submitted.
     pub fn notify_all_entries_submitted(
         self,
-    ) -> Result<BlockVerificationSession<AllEntriesSubmitted>, SchedulerShutdownError> {
-        self.send(ReplayToBlockVerificationMessage::AllEntriesSubmitted(
+    ) -> Result<BlockVerificationSession<AllEntriesSubmitted>, SchedulerSendError<Self>> {
+        if let Err(error) = self.send(ReplayToBlockVerificationMessage::AllEntriesSubmitted(
             AllEntriesSubmittedMessage {
                 bank_id: self.bank_id,
             },
-        ))?;
+        )) {
+            return Err(map_send_error(error, |_message| self));
+        }
 
         Ok(BlockVerificationSession::<AllEntriesSubmitted> {
             bank_id: self.bank_id,
@@ -247,5 +261,23 @@ impl BlockVerificationSession<Started> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct SchedulerShutdownError;
+/// A failed send to the scheduler
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum SchedulerSendError<T> {
+    #[error("the scheduler's channel is full")]
+    Full(T),
+    #[error("the scheduler has shut down")]
+    SchedulerShutdown(T),
+}
+
+fn map_send_error<T>(
+    error: TrySendError<ReplayToBlockVerificationMessage>,
+    inner_value: impl FnOnce(ReplayToBlockVerificationMessage) -> T,
+) -> SchedulerSendError<T> {
+    match error {
+        TrySendError::Full(message) => SchedulerSendError::Full(inner_value(message)),
+        TrySendError::Disconnected(message) => {
+            SchedulerSendError::SchedulerShutdown(inner_value(message))
+        }
+    }
+}

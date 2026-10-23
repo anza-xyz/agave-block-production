@@ -1,3 +1,5 @@
+pub(crate) mod entry_hash_verification;
+
 use {
     crate::join_thread,
     crossbeam_channel::{Receiver, Sender, bounded},
@@ -77,6 +79,11 @@ impl<Request: Send + Debug, Response> VerificationQueue<Request, Response> {
             .checked_sub(1)
             .expect("each response answers a request that was counted as in flight when sent");
     }
+
+    #[cfg(test)]
+    pub(crate) fn requests_in_flight(&self) -> usize {
+        self.requests_in_flight
+    }
 }
 
 /// A pool of worker threads, each answering requests from a shared queue.
@@ -106,6 +113,14 @@ impl VerificationWorkers {
             .collect();
 
         Self { worker_handles }
+    }
+
+    /// No worker threads, for tests that act as the workers themselves.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Self {
+            worker_handles: Vec::new(),
+        }
     }
 
     pub(crate) fn join_workers(self) {

@@ -1,15 +1,20 @@
 use {
     bytes::Bytes,
     solana_clock::{BankId, Slot},
-    solana_entry::entry::EntryView,
+    solana_entry::entry::{EntryVerificationData, EntryView},
     solana_hash::Hash,
 };
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BlockVerificationOutcome {
     Verified,
-    VerificationFailed,
+    VerificationFailed(VerificationFailureReason),
     Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationFailureReason {
+    InvalidEntryHash,
 }
 
 #[derive(Debug)]
@@ -35,7 +40,6 @@ pub struct BlockVerificationToReplayMessage {
 }
 
 #[derive(Debug)]
-#[expect(dead_code, reason = "handling entries will be added in follow up")]
 pub(crate) struct EntryMessage {
     pub(crate) bank_id: BankId,
     pub(crate) entry_view: EntryView<Bytes>,
@@ -49,4 +53,18 @@ pub(crate) struct AllEntriesSubmittedMessage {
 #[derive(Debug)]
 pub(crate) struct AbortMessage {
     pub(crate) bank_id: BankId,
+}
+
+#[derive(Debug)]
+pub(crate) struct EntryHashVerificationRequest {
+    pub(crate) bank_id: BankId,
+    /// The hash of the previous entry, or the parent bank's last entry hash for the first entry.
+    pub(crate) start_hash: Hash,
+    pub(crate) entry_verification_data: EntryVerificationData,
+}
+
+#[derive(Debug)]
+pub(crate) struct EntryHashVerificationResponse {
+    pub(crate) bank_id: BankId,
+    pub(crate) verified: bool,
 }

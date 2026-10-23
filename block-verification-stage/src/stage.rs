@@ -10,12 +10,13 @@
 //!   ┌─────────────┐  submit_entry(entry)
 //!   │   Started   │◄─────────┐
 //!   │             │──────────┘
-//!   └─────────────┘
-//!     │    │
-//!     │    │ notify_all_entries_submitted()
-//!     │    ▼
-//!     │  ┌─────────────────────┐
-//!     │  │ AllEntriesSubmitted │── Verified | VerificationFailed ──►┐
+//!   │             │── VerificationFailed ──────────────────────────►┐
+//!   └─────────────┘                                                 │
+//!     │    │                                                        │
+//!     │    │ notify_all_entries_submitted()                         │
+//!     │    ▼                                                        │
+//!     │  ┌─────────────────────┐                                    │
+//!     │  │ AllEntriesSubmitted │── Verified | VerificationFailed ──►┤
 //!     │  └─────────────────────┘                                    │
 //!     │    │                                                        │
 //!     ├────┘ abort_block_verification()                             │
@@ -29,8 +30,10 @@
 //!
 //!   Outcome, sent once per block on BlockVerificationStage::scheduler_message_receiver()
 //!   as BlockVerificationToReplayMessage { slot, bank_id, verification_status }:
-//!     Verified | VerificationFailed  ──► all entries submitted and verification finished
-//!     Aborted                        ──► aborted before verification finished
+//!     Verified            ──► all entries submitted and verified
+//!     VerificationFailed  ──► an entry failed verification, possibly before all entries were
+//!                             submitted. Entries submitted afterwards are ignored
+//!     Aborted             ──► aborted before verification finished
 //!   An abort arriving after the outcome was sent is ignored.
 //!
 //!   Every transition fails with an error if the scheduler has shut down.
@@ -219,6 +222,10 @@ impl BlockVerificationSession<Started> {
         Ok(session)
     }
 
+    /// Submits the next entry of the block to be verified.
+    ///
+    /// Entries must be submitted in block order. Once the block failed verification, its entries
+    /// are ignored.
     pub fn submit_entry(&self, entry_view: EntryView<Bytes>) -> Result<(), SchedulerShutdownError> {
         self.send(ReplayToBlockVerificationMessage::Entry(EntryMessage {
             bank_id: self.bank_id,

@@ -7,7 +7,7 @@ pub use {config::SchedulerConfig, stage::BlockVerificationStage};
 
 mod config;
 mod scheduler;
-#[expect(dead_code, reason = "the scheduler uses the workers in a follow up")]
+pub(crate) mod utils;
 mod workers;
 
 pub mod messages;

@@ -1,6 +1,7 @@
 use {
     super::*,
     crate::{
+        check_response::{Payload, TransactionPayload},
         resolved_transaction::ResolvedTransaction,
         tpu_ingress::{
             MAX_PACKETS_PER_CHECK_BATCH, MAX_TPU_PACKETS_PER_ITERATION, TpuTransactionMeta,
@@ -152,11 +153,13 @@ pub(super) fn insert(
         .insert(
             priority,
             TransactionState {
-                transaction,
-                metadata: TpuTransactionMeta {
-                    flags: 0,
-                    src_addr: [0; 16],
-                },
+                payload: Payload::Transaction(TransactionPayload {
+                    transaction,
+                    metadata: TpuTransactionMeta {
+                        flags: 0,
+                        src_addr: [0; 16],
+                    },
+                }),
                 cost,
                 allocated_accounts_data_size: 1,
                 execution_worker: None,

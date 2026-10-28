@@ -123,12 +123,7 @@ fn complete_transaction(
     let transaction = transactions.get_mut(id).unwrap();
     assert_eq!(transaction.execution_worker.take(), Some(worker));
     let cost = transaction.cost;
-    let writable = transaction.transaction.writable_accounts();
-    let readonly = transaction.transaction.readonly_accounts();
-    let account_keys = writable
-        .map(|key| (key, true))
-        .chain(readonly.map(|key| (key, false)));
-    account_locks.unlock_accounts(account_keys, worker);
+    account_locks.unlock_accounts(transaction.account_keys(), worker);
     match action {
         ExecutionResponseAction::RequeueInCurrentSlot => {
             transactions.requeue(id);
@@ -137,7 +132,7 @@ fn complete_transaction(
         ExecutionResponseAction::Release => {
             let transaction = transactions.remove(id).unwrap();
             // SAFETY: the worker and scheduler have released all references to this transaction.
-            unsafe { transaction.transaction.free(allocator) };
+            unsafe { transaction.free(allocator) };
         }
     }
     cost
@@ -178,6 +173,7 @@ mod tests {
     use {
         super::*,
         crate::{
+            check_response::Payload,
             progress_tracker::SchedulerState,
             tests::{insert, setup_with_workers},
         },
@@ -206,21 +202,19 @@ mod tests {
             scheduler.transactions.dequeue(&priority_id);
             let state = scheduler.transactions.get_mut(id).unwrap();
             state.execution_worker = Some(worker);
-            let writable = state.transaction.writable_accounts();
-            let readonly = state.transaction.readonly_accounts();
-            let account_keys = writable
-                .map(|key| (key, true))
-                .chain(readonly.map(|key| (key, false)));
+            let Payload::Transaction(payload) = &state.payload else {
+                panic!("expected a transaction");
+            };
             scheduler
                 .account_locks
                 .try_lock_accounts(
-                    account_keys,
+                    state.account_keys(),
                     ThreadSet::any(scheduler.workers.len()),
                     |_| worker,
                 )
                 .unwrap();
             // SAFETY: the retained transaction belongs to this allocator.
-            let region = unsafe { state.transaction.to_region(&scheduler.allocator) };
+            let region = unsafe { payload.transaction.to_region(&scheduler.allocator) };
             // SAFETY: the initialized transaction remains retained until its response is handled.
             unsafe { batch.try_push(region, id) }.unwrap();
             cost = cost.saturating_add(state.cost);

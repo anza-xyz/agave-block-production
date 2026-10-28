@@ -15,6 +15,8 @@ use {
         pubkeys_ptr::OwnedPubkeysPtr, responses_region::CheckResponsesPtr,
         transaction_ptr::OwnedTransactionPtr,
     },
+    rts_alloc::Allocator,
+    solana_pubkey::Pubkey,
     solana_svm_transaction::svm_message::{SVMMessage, SVMStaticMessage},
 };
 
@@ -24,14 +26,70 @@ const PRIORITY_MULTIPLIER: u64 = 1_000_000;
 
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "metadata retained for scheduling")
+    expect(dead_code, reason = "data size retained for scheduling")
 )]
 pub(super) struct TransactionState {
-    pub(super) transaction: ResolvedTransaction,
-    pub(super) metadata: TpuTransactionMeta,
+    pub(super) payload: Payload,
     pub(super) cost: u64,
     pub(super) allocated_accounts_data_size: u64,
     pub(super) execution_worker: Option<usize>,
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "transactions are the common case and are stored inline"
+)]
+pub(super) enum Payload {
+    Transaction(TransactionPayload),
+    #[expect(dead_code, reason = "bundles are not handled yet")]
+    Bundle(BundlePayload),
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "metadata retained for scheduling")
+)]
+pub(super) struct TransactionPayload {
+    pub(super) transaction: ResolvedTransaction,
+    pub(super) metadata: TpuTransactionMeta,
+}
+
+pub(super) struct BundlePayload {
+    pub(super) members: Box<[ResolvedTransaction]>,
+}
+
+const _: () = assert!(size_of::<Payload>() == size_of::<TransactionPayload>());
+
+impl TransactionState {
+    fn members(&self) -> &[ResolvedTransaction] {
+        match &self.payload {
+            Payload::Transaction(payload) => core::slice::from_ref(&payload.transaction),
+            Payload::Bundle(payload) => &payload.members,
+        }
+    }
+
+    pub(super) fn account_keys(&self) -> impl Iterator<Item = (&Pubkey, bool)> + Clone {
+        self.members()
+            .iter()
+            .flat_map(|member| member.account_keys())
+    }
+
+    /// # Safety
+    /// Every transaction must belong to `allocator` and have no remaining references.
+    pub(super) unsafe fn free(self, allocator: &Allocator) {
+        match self.payload {
+            Payload::Transaction(payload) => {
+                // SAFETY: the caller guarantees ownership and the allocator.
+                unsafe { payload.transaction.free(allocator) };
+            }
+            Payload::Bundle(payload) => {
+                for member in payload.members {
+                    // SAFETY: the caller guarantees ownership and the allocator.
+                    unsafe { member.free(allocator) };
+                }
+            }
+        }
+    }
 }
 
 impl Scheduler {
@@ -134,8 +192,10 @@ impl Scheduler {
                 .copied();
             let transaction = TransactionState {
                 execution_worker: None,
-                transaction,
-                metadata,
+                payload: Payload::Transaction(TransactionPayload {
+                    transaction,
+                    metadata,
+                }),
                 cost: response.estimated_cost_units,
                 allocated_accounts_data_size: response.allocated_accounts_data_size,
             };
@@ -148,13 +208,13 @@ impl Scheduler {
             match inserted {
                 Err(transaction) => {
                     // SAFETY: rejection or eviction returns exclusive ownership.
-                    unsafe { transaction.transaction.free(&self.allocator) };
+                    unsafe { transaction.free(&self.allocator) };
                 }
                 Ok((_, removed)) => {
                     if let Some(removed) = removed {
                         let transaction = removed.into_transaction();
                         // SAFETY: removal returns exclusive ownership.
-                        unsafe { transaction.transaction.free(&self.allocator) };
+                        unsafe { transaction.free(&self.allocator) };
                         dropped = dropped.saturating_add(1);
                     }
                     dropped = dropped
@@ -397,22 +457,25 @@ mod tests {
         assert_eq!(scheduler.transactions.len(), 1);
         let id = scheduler.transactions.pop_highest().unwrap();
         let state = scheduler.transactions.get(id).unwrap();
-        assert_eq!(state.metadata.src_addr, [7; 16]);
+        let Payload::Transaction(payload) = &state.payload else {
+            panic!("expected a transaction");
+        };
+        assert_eq!(payload.metadata.src_addr, [7; 16]);
         assert_eq!(state.cost, response.estimated_cost_units);
         assert_eq!(
             state.allocated_accounts_data_size,
             response.allocated_accounts_data_size
         );
         assert_eq!(
-            state.transaction.view.account_keys().get(1),
+            payload.transaction.view.account_keys().get(1),
             Some(&Pubkey::from([3; 32]))
         );
-        assert!(state.transaction.view.is_writable(1));
+        assert!(payload.transaction.view.is_writable(1));
         assert_eq!(
-            state.transaction.view.account_keys().get(2),
+            payload.transaction.view.account_keys().get(2),
             Some(&Pubkey::from([4; 32]))
         );
-        assert!(!state.transaction.view.is_writable(2));
+        assert!(!payload.transaction.view.is_writable(2));
     }
 
     #[test]
@@ -489,7 +552,7 @@ mod tests {
         let id = scheduler.transactions.pop_highest().unwrap();
         let state = scheduler.transactions.remove(id).unwrap();
         // SAFETY: removal returns exclusive ownership of the transaction's allocations.
-        unsafe { state.transaction.free(&scheduler.allocator) };
+        unsafe { state.free(&scheduler.allocator) };
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
     }
 
@@ -519,7 +582,7 @@ mod tests {
         let state = scheduler.transactions.remove(id).unwrap();
         assert_eq!(state.cost, 99);
         // SAFETY: removal returns exclusive ownership of the transaction's allocations.
-        unsafe { state.transaction.free(&scheduler.allocator) };
+        unsafe { state.free(&scheduler.allocator) };
         assert_eq!(scheduler.allocator.outstanding_allocation_bytes(), 0);
     }
 

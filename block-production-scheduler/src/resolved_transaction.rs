@@ -55,6 +55,12 @@ impl ResolvedTransaction {
             .filter_map(|(index, key)| (!self.view.is_writable(index)).then_some(key))
     }
 
+    pub(super) fn account_keys(&self) -> impl Iterator<Item = (&Pubkey, bool)> + Clone {
+        self.writable_accounts()
+            .map(|key| (key, true))
+            .chain(self.readonly_accounts().map(|key| (key, false)))
+    }
+
     /// # Safety
     /// The transaction must belong to `allocator` and remain alive while the region is used.
     pub(super) unsafe fn to_region(

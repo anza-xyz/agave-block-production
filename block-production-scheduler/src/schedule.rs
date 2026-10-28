@@ -1,7 +1,10 @@
 use {
     crate::{
-        Scheduler, check_response::TransactionState, in_flight_tracker::InFlightTracker,
-        progress_tracker::SchedulerState, scheduling_details::SchedulingSummary,
+        Scheduler,
+        check_response::{Payload, TransactionPayload, TransactionState},
+        in_flight_tracker::InFlightTracker,
+        progress_tracker::SchedulerState,
+        scheduling_details::SchedulingSummary,
     },
     agave_scheduler_bindings::PackToExecutionWorkerMessage,
     agave_scheduler_handshake::ClientWorkerSession,
@@ -71,9 +74,13 @@ impl Scheduler {
                 break;
             }
             let transaction = self.transactions.get(id.id).unwrap();
+            let Payload::Transaction(payload) = &transaction.payload else {
+                unreachable!("bundles are not handled yet");
+            };
             let worker = match try_schedule_transaction(
                 id.id,
                 transaction,
+                payload,
                 &mut self.account_locks,
                 &mut batches,
                 &mut allowed_workers,
@@ -111,20 +118,17 @@ impl Scheduler {
 fn try_schedule_transaction(
     id: usize,
     transaction: &TransactionState,
+    payload: &TransactionPayload,
     account_locks: &mut ThreadAwareAccountLocks,
     batches: &mut ExecutionBatches<'_>,
     allowed_workers: &mut ThreadSet,
 ) -> Result<ThreadId, TryLockError> {
-    let writable = transaction.transaction.writable_accounts();
-    let readonly = transaction.transaction.readonly_accounts();
-    let account_keys = writable
-        .map(|key| (key, true))
-        .chain(readonly.map(|key| (key, false)));
+    let account_keys = transaction.account_keys();
     let worker =
         account_locks.try_lock_accounts(account_keys.clone(), *allowed_workers, |eligible| {
             select_worker(eligible, batches)
         })?;
-    if !batches.try_push(worker, id, transaction, allowed_workers) {
+    if !batches.try_push(worker, id, transaction, payload, allowed_workers) {
         account_locks.unlock_accounts(account_keys, worker);
         return Err(TryLockError::ThreadNotAllowed);
     }
@@ -284,9 +288,10 @@ impl<'a> ExecutionBatches<'a> {
         worker: ThreadId,
         id: usize,
         transaction: &TransactionState,
+        payload: &TransactionPayload,
         allowed_workers: &mut ThreadSet,
     ) -> bool {
-        let transaction_bytes = transaction.transaction.view.data().len() as u64;
+        let transaction_bytes = payload.transaction.view.data().len() as u64;
         if self.should_send_before(worker, transaction_bytes) {
             self.send_all(allowed_workers);
         }
@@ -296,7 +301,7 @@ impl<'a> ExecutionBatches<'a> {
         let pending = &mut self.pending_worker_batches[worker];
         let batch = pending.batch.as_mut().expect("batch has been prepared");
         // SAFETY: the scheduler retains this allocation until execution completes.
-        let region = unsafe { transaction.transaction.to_region(self.allocator) };
+        let region = unsafe { payload.transaction.to_region(self.allocator) };
         // SAFETY: the region belongs to this allocator and remains retained by the scheduler.
         unsafe { batch.try_push(region, id) }.expect("full batches are sent immediately");
         pending.cost_units = pending.cost_units.saturating_add(transaction.cost);
@@ -420,11 +425,14 @@ mod tests {
         for (transaction, id) in batch.iter() {
             let state = scheduler.transactions.get_mut(id).unwrap();
             assert_eq!(state.execution_worker, Some(worker));
+            let Payload::Transaction(payload) = &state.payload else {
+                panic!("expected a transaction");
+            };
             // SAFETY: both pointers belong to the scheduler allocator and are still retained.
             let region =
                 unsafe { transaction.to_sharable_transaction_region(&scheduler.allocator) };
             // SAFETY: this retained transaction belongs to the scheduler allocator.
-            let expected_region = unsafe { state.transaction.to_region(&scheduler.allocator) };
+            let expected_region = unsafe { payload.transaction.to_region(&scheduler.allocator) };
             assert_eq!(region.offset, expected_region.offset);
             state.execution_worker = None;
         }
@@ -550,14 +558,11 @@ mod tests {
             scheduler.in_flight.track_batch(0, 0, 0);
         }
         let first = insert(&mut scheduler, 3, 1, &[1]);
-        let transaction_bytes = scheduler
-            .transactions
-            .get(first)
-            .unwrap()
-            .transaction
-            .view
-            .data()
-            .len() as u64;
+        let Payload::Transaction(payload) = &scheduler.transactions.get(first).unwrap().payload
+        else {
+            panic!("expected a transaction");
+        };
+        let transaction_bytes = payload.transaction.view.data().len() as u64;
         scheduler.target_entry_bytes_per_batch = ENTRY_OVERHEAD_BYTES + transaction_bytes + 1;
         let second = insert(&mut scheduler, 2, 1, &[1]);
         let deferred = insert(&mut scheduler, 1, 1, &[1, 3]);
@@ -596,14 +601,11 @@ mod tests {
         {
             let (mut scheduler, mut agave) = setup();
             let first = insert(&mut scheduler, 3, 1, &[1]);
-            let transaction_bytes = scheduler
-                .transactions
-                .get(first)
-                .unwrap()
-                .transaction
-                .view
-                .data()
-                .len() as u64;
+            let Payload::Transaction(payload) = &scheduler.transactions.get(first).unwrap().payload
+            else {
+                panic!("expected a transaction");
+            };
+            let transaction_bytes = payload.transaction.view.data().len() as u64;
             scheduler.target_entry_bytes_per_batch =
                 ENTRY_OVERHEAD_BYTES + transaction_bytes * transactions_per_target - below_target;
             let second = insert(&mut scheduler, 2, 1, &[1]);

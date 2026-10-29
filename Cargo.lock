@@ -70,6 +70,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-engine-proto"
+version = "4.5.0-alpha.3"
+dependencies = [
+ "prost 0.14.4",
+ "prost-types 0.14.4",
+ "protobuf-src",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "agave-block-production-scheduler"
 version = "4.5.0-alpha.3"
 dependencies = [

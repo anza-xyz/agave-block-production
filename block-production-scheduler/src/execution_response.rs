@@ -123,7 +123,7 @@ fn complete_transaction(
     let transaction = transactions.get_mut(id).unwrap();
     assert_eq!(transaction.execution_worker.take(), Some(worker));
     let cost = transaction.cost;
-    account_locks.unlock_accounts(transaction.account_keys(), worker);
+    account_locks.unlock_accounts(transaction.account_keys_with_writable(), worker);
     match action {
         ExecutionResponseAction::RequeueInCurrentSlot => {
             transactions.requeue(id);
@@ -208,7 +208,7 @@ mod tests {
             scheduler
                 .account_locks
                 .try_lock_accounts(
-                    state.account_keys(),
+                    state.account_keys_with_writable(),
                     ThreadSet::any(scheduler.workers.len()),
                     |_| worker,
                 )

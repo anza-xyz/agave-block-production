@@ -55,7 +55,10 @@ impl ResolvedTransaction {
             .filter_map(|(index, key)| (!self.view.is_writable(index)).then_some(key))
     }
 
-    pub(super) fn account_keys(&self) -> impl Iterator<Item = (&Pubkey, bool)> + Clone {
+    /// Account keys paired with `true` if writable, `false` if read-only.
+    pub(super) fn account_keys_with_writable(
+        &self,
+    ) -> impl Iterator<Item = (&Pubkey, bool)> + Clone {
         self.writable_accounts()
             .map(|key| (key, true))
             .chain(self.readonly_accounts().map(|key| (key, false)))

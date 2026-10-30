@@ -123,7 +123,7 @@ fn try_schedule_transaction(
     batches: &mut ExecutionBatches<'_>,
     allowed_workers: &mut ThreadSet,
 ) -> Result<ThreadId, TryLockError> {
-    let account_keys = transaction.account_keys();
+    let account_keys = transaction.account_keys_with_writable();
     let worker =
         account_locks.try_lock_accounts(account_keys.clone(), *allowed_workers, |eligible| {
             select_worker(eligible, batches)

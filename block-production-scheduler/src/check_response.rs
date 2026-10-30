@@ -68,10 +68,14 @@ impl TransactionState {
         }
     }
 
-    pub(super) fn account_keys(&self) -> impl Iterator<Item = (&Pubkey, bool)> + Clone {
+    /// Account keys of every member paired with `true` if writable, `false` if read-only.
+    /// Keys shared by bundle members are repeated.
+    pub(super) fn account_keys_with_writable(
+        &self,
+    ) -> impl Iterator<Item = (&Pubkey, bool)> + Clone {
         self.members()
             .iter()
-            .flat_map(|member| member.account_keys())
+            .flat_map(|member| member.account_keys_with_writable())
     }
 
     /// # Safety

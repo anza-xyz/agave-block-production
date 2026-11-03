@@ -7,9 +7,10 @@ use {
             auth_service_client::AuthServiceClient,
         },
         block_engine::{
-            SubscribePacketsRequest, SubscribePacketsResponse,
-            block_engine_validator_client::BlockEngineValidatorClient,
+            SubscribeBundlesRequest, SubscribeBundlesResponse, SubscribePacketsRequest,
+            SubscribePacketsResponse, block_engine_validator_client::BlockEngineValidatorClient,
         },
+        bundle::BundleUuid,
         packet::{Meta as ProtoMeta, Packet},
     },
     crossbeam_channel::{Sender, TrySendError},
@@ -73,7 +74,7 @@ enum SessionError {
     MissingAccessToken,
     #[error("invalid access token: {0}")]
     InvalidAccessToken(#[from] InvalidMetadataValue),
-    #[error("packet receiver disconnected")]
+    #[error("receiver disconnected")]
     ReceiverDisconnected,
 }
 
@@ -116,12 +117,48 @@ fn meta_from_proto(proto_meta: &ProtoMeta, size: usize) -> Meta {
     meta
 }
 
-/// Authenticates with a block engine as a validator and forwards the packets it
-/// streams. Reconnects with a fixed backoff after any failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEngineBundle {
+    pub uuid: String,
+    pub packets: PacketBatch,
+}
+
+impl BlockEngineBundle {
+    /// Returns `None` if the bundle is empty or any member would be dropped.
+    fn from_proto(bundle: BundleUuid) -> Option<Self> {
+        let BundleUuid { bundle, uuid } = bundle;
+        let packets = bundle?
+            .packets
+            .into_iter()
+            .map(packet_from_proto)
+            .collect::<Option<Vec<_>>>()?;
+        if packets.is_empty() {
+            return None;
+        }
+        Some(Self {
+            uuid,
+            packets: PacketBatch::from(packets),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockEngineMessage {
+    Packets(PacketBatch),
+    Bundles(Vec<BlockEngineBundle>),
+}
+
+struct Subscriptions {
+    packets: Streaming<SubscribePacketsResponse>,
+    bundles: Streaming<SubscribeBundlesResponse>,
+}
+
+/// Authenticates with a block engine as a validator and forwards the packets
+/// and bundles it streams. Reconnects with a fixed backoff after any failure.
 pub struct BlockEngineClient {
     url: String,
     identity: Keypair,
-    packet_sender: Sender<PacketBatch>,
+    sender: Sender<BlockEngineMessage>,
     config: BlockEngineClientConfig,
 }
 
@@ -129,18 +166,18 @@ impl BlockEngineClient {
     pub fn new(
         url: String,
         identity: Keypair,
-        packet_sender: Sender<PacketBatch>,
+        sender: Sender<BlockEngineMessage>,
         config: BlockEngineClientConfig,
     ) -> Self {
         Self {
             url,
             identity,
-            packet_sender,
+            sender,
             config,
         }
     }
 
-    /// Runs the client on its own thread until `cancel` is cancelled or the packet
+    /// Runs the client on its own thread until `cancel` is cancelled or the
     /// receiver is dropped.
     pub fn spawn(self, cancel: CancellationToken) -> io::Result<JoinHandle<()>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -152,9 +189,12 @@ impl BlockEngineClient {
                 runtime.block_on(cancel.run_until_cancelled_owned(self.reconnect_loop(
                     async || {
                         let channel = connect(&self.url, &self.config).await?;
-                        let packets = self.subscribe(channel).await?;
-                        info!("Subscribed to block engine {} packets", self.url);
-                        self.consume(packets).await
+                        let Subscriptions { packets, bundles } = self.subscribe(channel).await?;
+                        info!(
+                            "Subscribed to block engine {} packets and bundles",
+                            self.url
+                        );
+                        self.consume(packets, bundles).await
                     },
                 )));
             })
@@ -165,9 +205,9 @@ impl BlockEngineClient {
     async fn reconnect_loop(&self, mut session: impl AsyncFnMut() -> Result<(), SessionError>) {
         loop {
             match session().await {
-                Ok(()) => info!("Block engine {} closed the packet stream", self.url),
+                Ok(()) => info!("Block engine {} closed a stream", self.url),
                 Err(SessionError::ReceiverDisconnected) => {
-                    info!("Block engine packet receiver disconnected, stopping client");
+                    info!("Block engine receiver disconnected, stopping client");
                     return;
                 }
                 Err(err) => warn!("Block engine session with {} failed: {err}", self.url),
@@ -176,32 +216,50 @@ impl BlockEngineClient {
         }
     }
 
-    /// Forwards packets from `packets` until the stream ends (`Ok`) or fails.
+    /// Forwards packets and bundles until either stream ends (`Ok`) or fails.
     async fn consume(
         &self,
         mut packets: impl Stream<Item = Result<SubscribePacketsResponse, Status>> + Unpin,
+        mut bundles: impl Stream<Item = Result<SubscribeBundlesResponse, Status>> + Unpin,
     ) -> Result<(), SessionError> {
-        while let Some(response) = packets.next().await {
-            self.forward(response?)?;
+        loop {
+            tokio::select! {
+                response = packets.next() => match response {
+                    Some(response) => self.forward_packets(response?)?,
+                    None => return Ok(()),
+                },
+                response = bundles.next() => match response {
+                    Some(response) => self.forward_bundles(response?)?,
+                    None => return Ok(()),
+                },
+            }
         }
-        Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        channel: Channel,
-    ) -> Result<Streaming<SubscribePacketsResponse>, SessionError> {
+    async fn subscribe(&self, channel: Channel) -> Result<Subscriptions, SessionError> {
         let access_token =
             authenticate(&mut AuthServiceClient::new(channel.clone()), &self.identity).await?;
-        let mut request = Request::new(SubscribePacketsRequest {});
-        request.metadata_mut().insert("authorization", access_token);
-        Ok(BlockEngineValidatorClient::new(channel)
-            .subscribe_packets(request)
+        let mut packets_request = Request::new(SubscribePacketsRequest {});
+        packets_request
+            .metadata_mut()
+            .insert("authorization", access_token.clone());
+        let mut bundles_request = Request::new(SubscribeBundlesRequest {});
+        bundles_request
+            .metadata_mut()
+            .insert("authorization", access_token);
+        let mut validator = BlockEngineValidatorClient::new(channel);
+        let packets = validator
+            .subscribe_packets(packets_request)
             .await?
-            .into_inner())
+            .into_inner();
+        let bundles = validator
+            .subscribe_bundles(bundles_request)
+            .await?
+            .into_inner();
+        Ok(Subscriptions { packets, bundles })
     }
 
-    fn forward(&self, response: SubscribePacketsResponse) -> Result<(), SessionError> {
+    fn forward_packets(&self, response: SubscribePacketsResponse) -> Result<(), SessionError> {
         let Some(batch) = response.batch else {
             return Ok(());
         };
@@ -213,13 +271,30 @@ impl BlockEngineClient {
         if packets.is_empty() {
             return Ok(());
         }
-        match self.packet_sender.try_send(packets.into()) {
+        self.send(BlockEngineMessage::Packets(packets.into()))
+    }
+
+    fn forward_bundles(&self, response: SubscribeBundlesResponse) -> Result<(), SessionError> {
+        let bundles: Vec<_> = response
+            .bundles
+            .into_iter()
+            .filter_map(BlockEngineBundle::from_proto)
+            .collect();
+        if bundles.is_empty() {
+            return Ok(());
+        }
+        self.send(BlockEngineMessage::Bundles(bundles))
+    }
+
+    fn send(&self, message: BlockEngineMessage) -> Result<(), SessionError> {
+        match self.sender.try_send(message) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(packets)) => {
-                debug!(
-                    "Dropping {} block engine packets: receiver is full",
-                    packets.len()
-                );
+            Err(TrySendError::Full(message)) => {
+                let (len, kind) = match &message {
+                    BlockEngineMessage::Packets(packets) => (packets.len(), "packets"),
+                    BlockEngineMessage::Bundles(bundles) => (bundles.len(), "bundles"),
+                };
+                debug!("Dropping {len} block engine {kind}: receiver is full");
                 Ok(())
             }
             Err(TrySendError::Disconnected(_)) => Err(SessionError::ReceiverDisconnected),
@@ -278,8 +353,11 @@ fn auth_tokens_request(identity: &Keypair, challenge: &str) -> GenerateAuthToken
 mod tests {
     use {
         super::*,
-        agave_block_engine_proto::packet::{
-            Meta as ProtoMeta, PacketBatch as ProtoPacketBatch, PacketFlags as ProtoPacketFlags,
+        agave_block_engine_proto::{
+            bundle::Bundle,
+            packet::{
+                Meta as ProtoMeta, PacketBatch as ProtoPacketBatch, PacketFlags as ProtoPacketFlags,
+            },
         },
         crossbeam_channel::{Receiver, TryRecvError, bounded},
         solana_perf::packet::bytes::Bytes,
@@ -296,7 +374,7 @@ mod tests {
     const BACKOFF: Duration = Duration::from_secs(5);
     const HALF_BACKOFF: Duration = Duration::from_millis(2500);
 
-    fn client(capacity: usize) -> (BlockEngineClient, Receiver<PacketBatch>) {
+    fn client(capacity: usize) -> (BlockEngineClient, Receiver<BlockEngineMessage>) {
         let (sender, receiver) = bounded(capacity);
         let client = BlockEngineClient::new(
             "http://localhost".into(),
@@ -305,6 +383,39 @@ mod tests {
             BlockEngineClientConfig::default(),
         );
         (client, receiver)
+    }
+
+    fn recv_packets(receiver: &Receiver<BlockEngineMessage>) -> PacketBatch {
+        let BlockEngineMessage::Packets(packets) = receiver.try_recv().unwrap() else {
+            panic!("expected packets");
+        };
+        packets
+    }
+
+    fn recv_bundles(receiver: &Receiver<BlockEngineMessage>) -> Vec<BlockEngineBundle> {
+        let BlockEngineMessage::Bundles(bundles) = receiver.try_recv().unwrap() else {
+            panic!("expected bundles");
+        };
+        bundles
+    }
+
+    fn bundle(uuid: &str, packets: Vec<Packet>) -> BundleUuid {
+        BundleUuid {
+            bundle: Some(Bundle {
+                header: None,
+                packets,
+            }),
+            uuid: uuid.into(),
+        }
+    }
+
+    fn bundles_response(uuids: &[&str]) -> SubscribeBundlesResponse {
+        SubscribeBundlesResponse {
+            bundles: uuids
+                .iter()
+                .map(|uuid| bundle(uuid, vec![valid_packet()]))
+                .collect(),
+        }
     }
 
     fn packet(data: &[u8], size: u64, addr: &str, flags: ProtoPacketFlags) -> Packet {
@@ -445,8 +556,8 @@ mod tests {
             data: Bytes::from_static(&[1]),
             meta: None,
         });
-        client.forward(response).unwrap();
-        assert_eq!(receiver.try_recv().unwrap().len(), 2);
+        client.forward_packets(response).unwrap();
+        assert_eq!(recv_packets(&receiver).len(), 2);
     }
 
     #[test]
@@ -463,29 +574,29 @@ mod tests {
     #[test]
     fn forwards_packet_batches() {
         let (client, receiver) = client(1);
-        client.forward(response(2)).unwrap();
-        assert_eq!(receiver.try_recv().unwrap().len(), 2);
+        client.forward_packets(response(2)).unwrap();
+        assert_eq!(recv_packets(&receiver).len(), 2);
     }
 
     #[test]
     fn skips_responses_without_packets() {
         let (client, receiver) = client(1);
         client
-            .forward(SubscribePacketsResponse {
+            .forward_packets(SubscribePacketsResponse {
                 header: None,
                 batch: None,
             })
             .unwrap();
-        client.forward(response(0)).unwrap();
+        client.forward_packets(response(0)).unwrap();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[test]
     fn drops_batches_when_receiver_is_full() {
         let (client, receiver) = client(1);
-        client.forward(response(1)).unwrap();
-        client.forward(response(2)).unwrap();
-        assert_eq!(receiver.try_recv().unwrap().len(), 1);
+        client.forward_packets(response(1)).unwrap();
+        client.forward_packets(response(2)).unwrap();
+        assert_eq!(recv_packets(&receiver).len(), 1);
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -494,26 +605,29 @@ mod tests {
         let (client, receiver) = client(1);
         drop(receiver);
         assert_matches!(
-            client.forward(response(1)),
+            client.forward_packets(response(1)),
             Err(SessionError::ReceiverDisconnected)
         );
     }
 
-    fn stream(
-        items: Vec<Result<SubscribePacketsResponse, Status>>,
-    ) -> impl Stream<Item = Result<SubscribePacketsResponse, Status>> + Unpin {
+    fn stream<T>(items: Vec<Result<T, Status>>) -> impl Stream<Item = Result<T, Status>> + Unpin {
         tokio_stream::iter(items)
     }
 
+    /// A stream that never yields, for the side a test does not use.
+    fn idle<T>() -> impl Stream<Item = Result<T, Status>> + Unpin {
+        tokio_stream::pending()
+    }
+
     #[tokio::test]
-    async fn consume_forwards_until_stream_ends() {
+    async fn consume_forwards_packets_until_stream_ends() {
         let (client, receiver) = client(2);
         let result = client
-            .consume(stream(vec![Ok(response(1)), Ok(response(2))]))
+            .consume(stream(vec![Ok(response(1)), Ok(response(2))]), idle())
             .await;
         assert_matches!(result, Ok(()));
-        assert_eq!(receiver.try_recv().unwrap().len(), 1);
-        assert_eq!(receiver.try_recv().unwrap().len(), 2);
+        assert_eq!(recv_packets(&receiver).len(), 1);
+        assert_eq!(recv_packets(&receiver).len(), 2);
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
     }
 
@@ -525,9 +639,9 @@ mod tests {
             Err(Status::internal("stream failed")),
             Ok(response(2)),
         ]);
-        let result = client.consume(&mut packets).await;
+        let result = client.consume(&mut packets, idle()).await;
         assert_matches!(result, Err(SessionError::Status(_)));
-        assert_eq!(receiver.try_recv().unwrap().len(), 1);
+        assert_eq!(recv_packets(&receiver).len(), 1);
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
 
         assert_eq!(packets.next().await.unwrap().unwrap(), response(2));
@@ -538,9 +652,67 @@ mod tests {
         let (client, receiver) = client(1);
         drop(receiver);
         let mut packets = stream(vec![Ok(response(1)), Ok(response(2))]);
-        let result = client.consume(&mut packets).await;
+        let result = client.consume(&mut packets, idle()).await;
         assert_matches!(result, Err(SessionError::ReceiverDisconnected));
         assert_eq!(packets.next().await.unwrap().unwrap(), response(2));
+    }
+
+    #[tokio::test]
+    async fn consume_forwards_bundles_until_stream_ends() {
+        let (client, receiver) = client(2);
+        let bundles = stream(vec![
+            Ok(bundles_response(&["first"])),
+            Ok(bundles_response(&["second", "third"])),
+        ]);
+        let result = client.consume(idle(), bundles).await;
+        assert_matches!(result, Ok(()));
+        let uuids = |bundles: Vec<BlockEngineBundle>| {
+            bundles
+                .into_iter()
+                .map(|bundle| bundle.uuid)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(uuids(recv_bundles(&receiver)), ["first"]);
+        assert_eq!(uuids(recv_bundles(&receiver)), ["second", "third"]);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn consume_stops_at_bundle_stream_error() {
+        let (client, receiver) = client(2);
+        let mut bundles = stream(vec![
+            Ok(bundles_response(&["first"])),
+            Err(Status::internal("stream failed")),
+            Ok(bundles_response(&["second"])),
+        ]);
+        let result = client.consume(idle(), &mut bundles).await;
+        assert_matches!(result, Err(SessionError::Status(_)));
+        assert_eq!(recv_bundles(&receiver).len(), 1);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            bundles.next().await.unwrap().unwrap(),
+            bundles_response(&["second"])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consume_forwards_from_both_streams() {
+        let (client, receiver) = client(4);
+        let packets = stream(vec![Ok(response(1)), Ok(response(2))]).chain(idle());
+        let bundles = stream(vec![Ok(bundles_response(&["bundle"]))]).chain(idle());
+        // Neither stream ends, so stop once everything has been forwarded.
+        let result = time::timeout(BACKOFF, client.consume(packets, bundles)).await;
+        assert!(result.is_err());
+        let (mut packets, mut bundles) = (Vec::new(), Vec::new());
+        while let Ok(message) = receiver.try_recv() {
+            match message {
+                BlockEngineMessage::Packets(batch) => packets.push(batch.len()),
+                BlockEngineMessage::Bundles(received) => bundles.extend(received),
+            }
+        }
+        assert_eq!(packets, [1, 2]);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].uuid, "bundle");
     }
 
     fn backoff_client() -> BlockEngineClient {
@@ -610,5 +782,111 @@ mod tests {
         assert_eq!(result, None);
         assert_eq!(sessions, 1);
         assert_eq!(start.elapsed(), HALF_BACKOFF);
+    }
+
+    #[test]
+    fn converts_bundle_members() {
+        let bundle = BlockEngineBundle::from_proto(bundle(
+            "uuid",
+            vec![
+                valid_packet(),
+                packet(&[4, 5, 0], 2, "::1", ProtoPacketFlags::default()),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(bundle.uuid, "uuid");
+        assert_eq!(
+            bundle
+                .packets
+                .iter()
+                .map(|packet| packet.data(..).unwrap())
+                .collect::<Vec<_>>(),
+            [&[1, 2, 3][..], &[4, 5]]
+        );
+    }
+
+    #[test]
+    fn rejects_bundle_with_discarded_packet() {
+        let discard = ProtoPacketFlags {
+            discard: true,
+            ..ProtoPacketFlags::default()
+        };
+        let bundle = bundle(
+            "discarded",
+            vec![valid_packet(), packet(&[1], 1, "", discard)],
+        );
+        assert_eq!(BlockEngineBundle::from_proto(bundle), None);
+    }
+
+    #[test]
+    fn rejects_bundle_with_malformed_packet() {
+        let bundle = bundle(
+            "malformed",
+            vec![
+                valid_packet(),
+                packet(&[1], 2, "", ProtoPacketFlags::default()),
+            ],
+        );
+        assert_eq!(BlockEngineBundle::from_proto(bundle), None);
+    }
+
+    #[test]
+    fn rejects_bundle_without_packets() {
+        assert_eq!(BlockEngineBundle::from_proto(bundle("empty", vec![])), None);
+    }
+
+    #[test]
+    fn rejects_missing_bundle() {
+        let bundle = BundleUuid {
+            bundle: None,
+            uuid: "missing".into(),
+        };
+        assert_eq!(BlockEngineBundle::from_proto(bundle), None);
+    }
+
+    #[test]
+    fn forwards_only_complete_bundles() {
+        let (client, receiver) = client(1);
+        client
+            .forward_bundles(SubscribeBundlesResponse {
+                bundles: vec![
+                    bundle("complete", vec![valid_packet()]),
+                    bundle("empty", vec![]),
+                ],
+            })
+            .unwrap();
+        let bundles = recv_bundles(&receiver);
+        assert_eq!(
+            bundles
+                .iter()
+                .map(|bundle| bundle.uuid.as_str())
+                .collect::<Vec<_>>(),
+            ["complete"]
+        );
+
+        client
+            .forward_bundles(SubscribeBundlesResponse {
+                bundles: vec![bundle("empty", vec![])],
+            })
+            .unwrap();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn drops_bundles_when_receiver_is_full_and_stops_when_disconnected() {
+        let (client, receiver) = client(1);
+        let response = || SubscribeBundlesResponse {
+            bundles: vec![bundle("uuid", vec![valid_packet()])],
+        };
+        client.forward_bundles(response()).unwrap();
+        client.forward_bundles(response()).unwrap();
+        assert_eq!(recv_bundles(&receiver).len(), 1);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+
+        drop(receiver);
+        assert_matches!(
+            client.forward_bundles(response()),
+            Err(SessionError::ReceiverDisconnected)
+        );
     }
 }

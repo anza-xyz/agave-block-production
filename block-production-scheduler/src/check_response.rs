@@ -81,6 +81,10 @@ impl TransactionState {
             .flat_map(|member| member.account_keys_with_writable())
     }
 
+    pub(super) fn is_bundle(&self) -> bool {
+        matches!(self.payload, Payload::Bundle(_))
+    }
+
     pub(super) fn num_transactions(&self) -> usize {
         self.members().len()
     }

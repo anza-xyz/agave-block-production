@@ -1,0 +1,38 @@
+[package]
+name = "agave-block-engine-client"
+description = "Agave block engine client"
+documentation = "https://docs.rs/agave-block-engine-client"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+agave-block-engine-proto = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+solana-keypair = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-signer = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tonic = { workspace = true, features = ["channel", "tls-native-roots", "tls-ring"] }
+
+[dev-dependencies]
+hyper-util = { workspace = true, features = ["server-auto", "service", "tokio"] }
+solana-signature = { workspace = true, features = ["verify"] }
+tokio = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

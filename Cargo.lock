@@ -70,6 +70,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-engine-client"
+version = "4.5.0-alpha.4"
+dependencies = [
+ "agave-block-engine-proto",
+ "crossbeam-channel",
+ "hyper-util",
+ "log",
+ "solana-keypair",
+ "solana-pubkey 4.4.0",
+ "solana-signature",
+ "solana-signer",
+ "thiserror 2.0.21",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "agave-block-engine-proto"
 version = "4.5.0-alpha.4"
 dependencies = [
@@ -3653,6 +3670,7 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.0.1",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -12665,6 +12683,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding 2.3.2",
  "pin-project",
+ "rustls-native-certs",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

@@ -43,6 +43,7 @@ fn config(path: &Path) -> Config {
             max_cost_units_per_batch: 1_000_000,
             target_entry_bytes_per_batch: 4_622,
         },
+        block_engine: None,
     }
 }
 
@@ -213,6 +214,7 @@ fn config_uses_shared_defaults_and_overrides() {
         scheduler.max_cost_units_per_worker
     );
     assert_eq!(config.scheduler.execution_margin, Duration::from_millis(10));
+    assert!(config.block_engine.is_none());
 
     let config = Config::from_toml(
         r"
@@ -252,6 +254,50 @@ fn config_requires_path_and_rejects_unknown_fields() {
         Config::from_toml("ipc_path = '/ledger/socket'\n[scheduler]\nfilter_keys = ['invalid']")
             .is_err()
     );
+}
+
+#[test]
+fn config_enables_block_engine_with_section() {
+    let config = Config::from_toml(
+        r"
+ipc_path = '/ledger/socket'
+[block_engine]
+url = 'https://block-engine.example'
+keypair_path = '/keys/identity.json'
+",
+    )
+    .unwrap();
+    let block_engine = config.block_engine.unwrap();
+    assert_eq!(block_engine.url, "https://block-engine.example");
+    assert_eq!(block_engine.keypair_path, Path::new("/keys/identity.json"));
+    assert_eq!(block_engine.block_engine_to_pack_capacity, 1024);
+
+    let config = Config::from_toml(
+        r"
+ipc_path = '/ledger/socket'
+[block_engine]
+url = 'https://block-engine.example'
+keypair_path = '/keys/identity.json'
+block_engine_to_pack_capacity = 16
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.block_engine.unwrap().block_engine_to_pack_capacity,
+        16
+    );
+}
+
+#[test]
+fn config_rejects_incomplete_block_engine_section() {
+    for block_engine in [
+        "keypair_path = '/keys/identity.json'",
+        "url = 'https://block-engine.example'",
+        "url = 'https://block-engine.example'\nkeypair_path = '/keys/identity.json'\nunknown = 1",
+    ] {
+        let source = format!("ipc_path = '/ledger/socket'\n[block_engine]\n{block_engine}");
+        assert!(Config::from_toml(&source).is_err(), "{block_engine}");
+    }
 }
 
 #[test]

@@ -53,7 +53,7 @@ mod transaction_container;
 #[cfg(test)]
 mod tests;
 
-pub use config::{Config, SchedulerConfig, SessionConfig};
+pub use config::{BlockEngineConfig, Config, SchedulerConfig, SessionConfig};
 
 struct Scheduler {
     state: SchedulerState,

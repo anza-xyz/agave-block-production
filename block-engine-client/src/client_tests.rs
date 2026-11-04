@@ -11,7 +11,9 @@ use {
             GetBlockEngineEndpointResponse, SubscribeBundlesRequest, SubscribeBundlesResponse,
             block_engine_validator_server::{BlockEngineValidator, BlockEngineValidatorServer},
         },
-        packet::{Meta, PacketBatch, PacketFlags},
+        packet::{
+            Meta as ProtoMeta, PacketBatch as ProtoPacketBatch, PacketFlags as ProtoPacketFlags,
+        },
     },
     crossbeam_channel::{Receiver, bounded},
     hyper_util::{
@@ -19,11 +21,12 @@ use {
         server::conn::auto,
         service::TowerToHyperService,
     },
+    solana_perf::packet::bytes::Bytes,
     solana_signature::Signature,
     std::{
         collections::HashSet,
         convert::Infallible,
-        net::{Ipv4Addr, TcpListener},
+        net::{IpAddr, Ipv4Addr, TcpListener},
         sync::{Mutex, atomic::AtomicUsize},
         time::Instant,
     },
@@ -49,7 +52,7 @@ enum PacketStream {
 struct MockBlockEngine {
     token_ttl: Duration,
     packet_stream: PacketStream,
-    batches: Vec<PacketBatch>,
+    batches: Vec<ProtoPacketBatch>,
     stall_auth: bool,
     fail_token_requests_from: Option<usize>,
     issued_tokens: Mutex<HashSet<String>>,
@@ -149,7 +152,7 @@ impl AuthService for MockBlockEngine {
     }
 }
 
-fn packets_response(batch: PacketBatch) -> Result<SubscribePacketsResponse, Status> {
+fn packets_response(batch: ProtoPacketBatch) -> Result<SubscribePacketsResponse, Status> {
     Ok(SubscribePacketsResponse {
         header: None,
         batch: Some(batch),
@@ -277,7 +280,7 @@ fn serve(mock: Arc<MockBlockEngine>) -> String {
 }
 
 struct RunningClient {
-    receiver: Receiver<Vec<BlockEnginePacket>>,
+    receiver: Receiver<PacketBatch>,
     exit: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
@@ -297,7 +300,7 @@ fn start(mock: &Arc<MockBlockEngine>) -> RunningClient {
 }
 
 impl RunningClient {
-    fn recv(&self) -> Vec<BlockEnginePacket> {
+    fn recv(&self) -> PacketBatch {
         self.receiver.recv_timeout(TIMEOUT).unwrap()
     }
 
@@ -319,14 +322,14 @@ fn wait_until(condition: impl Fn() -> bool) {
     }
 }
 
-fn batch(packets: Vec<Packet>) -> PacketBatch {
-    PacketBatch { packets }
+fn batch(packets: Vec<Packet>) -> ProtoPacketBatch {
+    ProtoPacketBatch { packets }
 }
 
-fn packet(data: &[u8], size: u64, flags: PacketFlags) -> Packet {
+fn packet(data: &[u8], size: u64, flags: ProtoPacketFlags) -> Packet {
     Packet {
-        data: data.to_vec(),
-        meta: Some(Meta {
+        data: Bytes::copy_from_slice(data),
+        meta: Some(ProtoMeta {
             size,
             addr: "10.0.0.1".into(),
             port: 8001,
@@ -336,8 +339,8 @@ fn packet(data: &[u8], size: u64, flags: PacketFlags) -> Packet {
     }
 }
 
-fn single_packet_batch() -> PacketBatch {
-    batch(vec![packet(&[1], 1, PacketFlags::default())])
+fn single_packet_batch() -> ProtoPacketBatch {
+    batch(vec![packet(&[1], 1, ProtoPacketFlags::default())])
 }
 
 /// Drops packets received so far, then waits for a new batch.
@@ -348,13 +351,13 @@ fn recv_fresh(client: &RunningClient) {
 
 #[test]
 fn authenticates_and_forwards_packets() {
-    let discard = PacketFlags {
+    let discard = ProtoPacketFlags {
         discard: true,
-        ..PacketFlags::default()
+        ..ProtoPacketFlags::default()
     };
-    let forwarded = PacketFlags {
+    let forwarded = ProtoPacketFlags {
         forwarded: true,
-        ..PacketFlags::default()
+        ..ProtoPacketFlags::default()
     };
     let mock = Arc::new(MockBlockEngine {
         batches: vec![batch(vec![
@@ -365,15 +368,14 @@ fn authenticates_and_forwards_packets() {
     });
     let client = start(&mock);
 
+    let mut meta = Meta::default();
+    meta.size = 3;
+    meta.addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    meta.port = 8001;
+    meta.flags.set(PacketFlags::FORWARDED, true);
     assert_eq!(
         client.recv(),
-        vec![BlockEnginePacket {
-            data: vec![1, 2, 3],
-            src_addr: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-            is_simple_vote: false,
-            forwarded: true,
-            from_staked_node: false,
-        }]
+        PacketBatch::from(vec![BytesPacket::new(Bytes::from_static(&[1, 2, 3]), meta)])
     );
     assert_eq!(mock.token_requests(), 1);
     assert_eq!(mock.subscription_tokens(), ["token-0"]);

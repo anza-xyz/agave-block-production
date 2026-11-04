@@ -23,6 +23,7 @@ agave-block-engine-proto = { workspace = true }
 crossbeam-channel = { workspace = true }
 log = { workspace = true }
 solana-keypair = { workspace = true }
+solana-perf = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signer = { workspace = true }
 thiserror = { workspace = true }

@@ -78,6 +78,7 @@ dependencies = [
  "hyper-util",
  "log",
  "solana-keypair",
+ "solana-perf",
  "solana-pubkey 4.4.0",
  "solana-signature",
  "solana-signer",

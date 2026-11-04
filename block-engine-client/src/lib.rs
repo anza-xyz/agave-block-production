@@ -10,17 +10,17 @@ use {
             SubscribePacketsRequest, SubscribePacketsResponse,
             block_engine_validator_client::BlockEngineValidatorClient,
         },
-        packet::Packet,
+        packet::{Meta as ProtoMeta, Packet},
     },
     crossbeam_channel::{Sender, TrySendError},
     log::{debug, info, warn},
     solana_keypair::Keypair,
+    solana_perf::packet::{BytesPacket, BytesPacketBatch, Meta, PacketBatch, PacketFlags},
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     std::{
         convert::Infallible,
         io,
-        net::IpAddr,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -74,37 +74,43 @@ enum SessionError {
     ReceiverDisconnected,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BlockEnginePacket {
-    pub data: Vec<u8>,
-    pub src_addr: Option<IpAddr>,
-    pub is_simple_vote: bool,
-    pub forwarded: bool,
-    pub from_staked_node: bool,
+/// Converts a block engine packet into a [`BytesPacket`].
+/// Returns `None` for discarded packets and packets with missing or
+/// inconsistent metadata.
+fn packet_from_proto(packet: Packet) -> Option<BytesPacket> {
+    let Packet { data, meta } = packet;
+    let meta = meta?;
+
+    // Nothing really blocks outside engine to just spam packets with flag set to discarded
+    // so lets skip them early
+    if meta.flags.as_ref().is_some_and(|flags| flags.discard) {
+        return None;
+    }
+    let size = usize::try_from(meta.size)
+        .ok()
+        .filter(|&size| size != 0 && size <= data.len())?;
+    Some(BytesPacket::new(
+        data.slice(..size),
+        meta_from_proto(&meta, size),
+    ))
 }
 
-impl BlockEnginePacket {
-    /// Returns `None` for discarded packets and packets with missing or
-    /// inconsistent metadata.
-    fn from_proto(packet: Packet) -> Option<Self> {
-        let Packet { mut data, meta } = packet;
-        let meta = meta?;
-        let flags = meta.flags.unwrap_or_default();
-        if flags.discard {
-            return None;
-        }
-        let size = usize::try_from(meta.size)
-            .ok()
-            .filter(|&size| size != 0 && size <= data.len())?;
-        data.truncate(size);
-        Some(Self {
-            data,
-            src_addr: meta.addr.parse().ok(),
-            is_simple_vote: flags.simple_vote_tx,
-            forwarded: flags.forwarded,
-            from_staked_node: flags.from_staked_node,
-        })
+/// Maps the proto metadata onto a packet [`Meta`] of `size` bytes. An address
+/// that fails to parse is left unspecified.
+fn meta_from_proto(proto_meta: &ProtoMeta, size: usize) -> Meta {
+    let flags = proto_meta.flags.unwrap_or_default();
+    let mut meta = Meta::default();
+    meta.size = size;
+    if let Ok(addr) = proto_meta.addr.parse() {
+        meta.addr = addr;
     }
+    meta.port = u16::try_from(proto_meta.port).unwrap_or_default();
+    meta.flags
+        .set(PacketFlags::SIMPLE_VOTE_TX, flags.simple_vote_tx);
+    meta.flags.set(PacketFlags::FORWARDED, flags.forwarded);
+    meta.flags
+        .set(PacketFlags::FROM_STAKED_NODE, flags.from_staked_node);
+    meta
 }
 
 /// Authenticates with a block engine as a validator and forwards the packets it
@@ -112,15 +118,11 @@ impl BlockEnginePacket {
 pub struct BlockEngineClient {
     url: String,
     identity: Keypair,
-    packet_sender: Sender<Vec<BlockEnginePacket>>,
+    packet_sender: Sender<PacketBatch>,
 }
 
 impl BlockEngineClient {
-    pub fn new(
-        url: String,
-        identity: Keypair,
-        packet_sender: Sender<Vec<BlockEnginePacket>>,
-    ) -> Self {
+    pub fn new(url: String, identity: Keypair, packet_sender: Sender<PacketBatch>) -> Self {
         Self {
             url,
             identity,
@@ -214,15 +216,15 @@ impl BlockEngineClient {
         let Some(batch) = response.batch else {
             return Ok(());
         };
-        let packets: Vec<_> = batch
+        let packets: BytesPacketBatch = batch
             .packets
             .into_iter()
-            .filter_map(BlockEnginePacket::from_proto)
+            .filter_map(packet_from_proto)
             .collect();
         if packets.is_empty() {
             return Ok(());
         }
-        match self.packet_sender.try_send(packets) {
+        match self.packet_sender.try_send(packets.into()) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(packets)) => {
                 debug!(
@@ -329,24 +331,27 @@ mod client_tests;
 mod tests {
     use {
         super::*,
-        agave_block_engine_proto::packet::{Meta, PacketBatch, PacketFlags},
+        agave_block_engine_proto::packet::{
+            Meta as ProtoMeta, PacketBatch as ProtoPacketBatch, PacketFlags as ProtoPacketFlags,
+        },
         crossbeam_channel::{Receiver, TryRecvError, bounded},
+        solana_perf::packet::bytes::Bytes,
         std::{
             assert_matches,
-            net::{Ipv4Addr, Ipv6Addr},
+            net::{IpAddr, Ipv4Addr, Ipv6Addr},
         },
     };
 
-    fn client(capacity: usize) -> (BlockEngineClient, Receiver<Vec<BlockEnginePacket>>) {
+    fn client(capacity: usize) -> (BlockEngineClient, Receiver<PacketBatch>) {
         let (sender, receiver) = bounded(capacity);
         let client = BlockEngineClient::new("http://localhost".into(), Keypair::new(), sender);
         (client, receiver)
     }
 
-    fn packet(data: &[u8], size: u64, addr: &str, flags: PacketFlags) -> Packet {
+    fn packet(data: &[u8], size: u64, addr: &str, flags: ProtoPacketFlags) -> Packet {
         Packet {
-            data: data.to_vec(),
-            meta: Some(Meta {
+            data: Bytes::copy_from_slice(data),
+            meta: Some(ProtoMeta {
                 size,
                 addr: addr.into(),
                 port: 8001,
@@ -357,67 +362,119 @@ mod tests {
     }
 
     fn valid_packet() -> Packet {
-        packet(&[1, 2, 3], 3, "127.0.0.1", PacketFlags::default())
+        packet(&[1, 2, 3], 3, "127.0.0.1", ProtoPacketFlags::default())
     }
 
     fn response(packets: usize) -> SubscribePacketsResponse {
         SubscribePacketsResponse {
             header: None,
-            batch: Some(PacketBatch {
+            batch: Some(ProtoPacketBatch {
                 packets: vec![valid_packet(); packets],
             }),
         }
     }
 
+    fn proto_meta(addr: &str, port: u32, flags: Option<ProtoPacketFlags>) -> ProtoMeta {
+        ProtoMeta {
+            size: 0,
+            addr: addr.into(),
+            port,
+            flags,
+            sender_stake: 0,
+        }
+    }
+
     #[test]
-    fn converts_packet_and_truncates_to_size() {
-        let flags = PacketFlags {
+    fn meta_from_proto_maps_fields() {
+        let flags = ProtoPacketFlags {
             simple_vote_tx: true,
             forwarded: true,
             from_staked_node: true,
-            ..PacketFlags::default()
+            ..ProtoPacketFlags::default()
         };
+        let mut proto_meta = proto_meta("10.0.0.1", 8001, Some(flags));
+        proto_meta.size = 100;
+        let meta = meta_from_proto(&proto_meta, 3);
+        assert_eq!(meta.size, 3);
+        assert_eq!(meta.addr, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(meta.port, 8001);
         assert_eq!(
-            BlockEnginePacket::from_proto(packet(&[1, 2, 3, 0, 0], 3, "10.0.0.1", flags)),
-            Some(BlockEnginePacket {
-                data: vec![1, 2, 3],
-                src_addr: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
-                is_simple_vote: true,
-                forwarded: true,
-                from_staked_node: true,
-            })
+            meta.flags,
+            PacketFlags::SIMPLE_VOTE_TX | PacketFlags::FORWARDED | PacketFlags::FROM_STAKED_NODE
         );
     }
 
     #[test]
-    fn parses_ipv6_and_ignores_invalid_addresses() {
-        let packet_from = |addr| {
-            BlockEnginePacket::from_proto(packet(&[1], 1, addr, PacketFlags::default()))
-                .unwrap()
-                .src_addr
+    fn meta_from_proto_ignores_unmapped_flags() {
+        let flags = ProtoPacketFlags {
+            discard: true,
+            repair: true,
+            tracer_packet: true,
+            ..ProtoPacketFlags::default()
         };
-        assert_eq!(packet_from("::1"), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert_eq!(packet_from("not an address"), None);
-        assert_eq!(packet_from(""), None);
+        let meta = meta_from_proto(&proto_meta("127.0.0.1", 0, Some(flags)), 1);
+        assert_eq!(meta.flags, PacketFlags::empty());
+        let meta = meta_from_proto(&proto_meta("127.0.0.1", 0, None), 1);
+        assert_eq!(meta.flags, PacketFlags::empty());
     }
 
     #[test]
-    fn rejects_discarded_and_malformed_packets() {
-        let discard = PacketFlags {
+    fn meta_from_proto_parses_ipv6_and_defaults_invalid_addresses() {
+        let addr_from = |addr| meta_from_proto(&proto_meta(addr, 0, None), 1).addr;
+        let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert_eq!(addr_from("::1"), IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert_eq!(addr_from("10.0.0.1:8001"), unspecified);
+        assert_eq!(addr_from("not an address"), unspecified);
+        assert_eq!(addr_from(""), unspecified);
+    }
+
+    #[test]
+    fn meta_from_proto_defaults_out_of_range_ports() {
+        let port_from = |port| meta_from_proto(&proto_meta("127.0.0.1", port, None), 1).port;
+        assert_eq!(port_from(u32::from(u16::MAX)), u16::MAX);
+        assert_eq!(port_from(u32::from(u16::MAX) + 1), 0);
+        assert_eq!(port_from(u32::MAX), 0);
+    }
+
+    #[test]
+    fn packet_from_proto_truncates_to_size_without_copying() {
+        let packet = packet(&[1, 2, 3, 0, 0], 3, "10.0.0.1", ProtoPacketFlags::default());
+        let data_ptr = packet.data.as_ptr();
+        let expected_meta = meta_from_proto(packet.meta.as_ref().unwrap(), 3);
+        let packet = packet_from_proto(packet).unwrap();
+        assert_eq!(packet.data(..), Some(&[1, 2, 3][..]));
+        assert_eq!(packet.buffer().as_ptr(), data_ptr);
+        assert_eq!(packet.meta(), &expected_meta);
+    }
+
+    #[test]
+    fn packet_from_proto_accepts_exact_size_and_missing_flags() {
+        let mut packet = packet(&[1, 2], 2, "127.0.0.1", ProtoPacketFlags::default());
+        packet.meta.as_mut().unwrap().flags = None;
+        let packet = packet_from_proto(packet).unwrap();
+        assert_eq!(packet.data(..), Some(&[1, 2][..]));
+        assert_eq!(packet.meta().size, 2);
+    }
+
+    #[test]
+    fn packet_from_proto_rejects_discarded_and_malformed_packets() {
+        let discard = ProtoPacketFlags {
             discard: true,
-            ..PacketFlags::default()
+            ..ProtoPacketFlags::default()
         };
         let no_meta = Packet {
-            data: vec![1],
+            data: Bytes::from_static(&[1]),
             meta: None,
         };
         for packet in [
-            packet(&[1], 1, "127.0.0.1", discard),
             no_meta,
-            packet(&[1], 2, "127.0.0.1", PacketFlags::default()),
-            packet(&[1], 0, "127.0.0.1", PacketFlags::default()),
+            packet(&[1], 1, "127.0.0.1", discard),
+            packet(&[1], 0, "127.0.0.1", ProtoPacketFlags::default()),
+            packet(&[1], 2, "127.0.0.1", ProtoPacketFlags::default()),
+            packet(&[1], u64::MAX, "127.0.0.1", ProtoPacketFlags::default()),
+            packet(&[], 0, "127.0.0.1", ProtoPacketFlags::default()),
         ] {
-            assert_eq!(BlockEnginePacket::from_proto(packet), None);
+            assert_eq!(packet_from_proto(packet), None);
         }
     }
 
@@ -426,7 +483,7 @@ mod tests {
         let (client, receiver) = client(1);
         let mut response = response(2);
         response.batch.as_mut().unwrap().packets.push(Packet {
-            data: vec![1],
+            data: Bytes::from_static(&[1]),
             meta: None,
         });
         client.forward(response).unwrap();

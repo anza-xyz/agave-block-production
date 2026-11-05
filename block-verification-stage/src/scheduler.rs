@@ -204,7 +204,7 @@ impl BlockVerificationScheduler {
     /// Dropping the scheduler drops its outcome sender, disconnecting the stage's receiver.
     fn run_scheduler_event_loop(mut self) -> Result<(), SchedulerExitReason> {
         while !self.shutdown_signal.load(Ordering::Relaxed) {
-            self.try_flush_buffered_replay_responses()?;
+            self.try_flush_completed_blocks()?;
             self.try_flush_buffered_signature_verification_requests();
             self.try_flush_buffered_transaction_check_requests();
 
@@ -219,19 +219,19 @@ impl BlockVerificationScheduler {
             select! {
                 recv(self.entry_hash_verification_queue.response_receiver()) -> response => {
                     let response = response.map_err(|_: RecvError| SchedulerExitReason::EntryHashVerificationWorkersExited)?;
-                    let () = self.handle_entry_hash_verification_response(response)?;
+                    let () = self.handle_entry_hash_verification_response(response);
                 }
                 recv(self.signature_verification_queue.response_receiver()) -> response => {
                     let response = response.map_err(|_: RecvError| SchedulerExitReason::SignatureVerificationWorkersExited)?;
-                    let () = self.handle_signature_verification_response(response)?;
+                    let () = self.handle_signature_verification_response(response);
                 }
                 recv(self.transaction_check_queue.response_receiver()) -> response => {
                     let response = response.map_err(|_: RecvError| SchedulerExitReason::TransactionCheckWorkersExited)?;
-                    let () = self.handle_transaction_check_response(response)?;
+                    let () = self.handle_transaction_check_response(response);
                 }
                 recv(replay_message_receiver) -> replay_message => {
                     let replay_message = replay_message.map_err(|_: RecvError| SchedulerExitReason::DisconnectedRequestChannel)?;
-                    let () = self.handle_replay_message(replay_message)?;
+                    let () = self.handle_replay_message(replay_message);
                 }
                 default(SHUTDOWN_POLL_INTERVAL) => {},
             }
@@ -288,9 +288,21 @@ impl BlockVerificationScheduler {
         }
     }
 
-    /// Sends buffered replay responses without blocking, stopping at the first
-    /// failed send. Any remaining responses stay buffered until the next flush.
-    fn try_flush_buffered_replay_responses(&mut self) -> Result<(), DisconnectedResponseChannel> {
+    /// Tries to send the [`BlockVerificationToReplayMessage`] for blocks that have a final outcome.
+    fn try_flush_completed_blocks(&mut self) -> Result<(), DisconnectedResponseChannel> {
+        self.blocks_in_progress.retain(|block_verification_state| {
+            let Some(verification_status) = block_verification_state.release_outcome() else {
+                return true;
+            };
+            self.buffered_replay_response_messages
+                .push_back(BlockVerificationToReplayMessage {
+                    slot: block_verification_state.slot,
+                    bank_id: block_verification_state.bank_id,
+                    verification_status,
+                });
+            false
+        });
+
         while let Some(message) = self.buffered_replay_response_messages.pop_front() {
             match self.replay_message_sender.try_send(message) {
                 Ok(()) => {}
@@ -307,18 +319,13 @@ impl BlockVerificationScheduler {
         Ok(())
     }
 
-    fn handle_replay_message(
-        &mut self,
-        replay_message: ReplayToBlockVerificationMessage,
-    ) -> Result<(), DisconnectedResponseChannel> {
+    fn handle_replay_message(&mut self, replay_message: ReplayToBlockVerificationMessage) {
         match replay_message {
             ReplayToBlockVerificationMessage::Begin(begin_message) => {
-                self.handle_begin_message(begin_message);
-                Ok(())
+                self.handle_begin_message(begin_message)
             }
             ReplayToBlockVerificationMessage::Entry(entry_message) => {
-                self.handle_entry_message(entry_message);
-                Ok(())
+                self.handle_entry_message(entry_message)
             }
             ReplayToBlockVerificationMessage::AllEntriesSubmitted(
                 all_entries_submitted_message,
@@ -451,49 +458,40 @@ impl BlockVerificationScheduler {
         self.buffered_transaction_check_requests.extend(requests);
     }
 
-    fn handle_abort_message(
-        &mut self,
-        AbortMessage { bank_id }: AbortMessage,
-    ) -> Result<(), DisconnectedResponseChannel> {
-        let Some(mut block_verification_state) = self.take_block_verification_state(&bank_id)
-        else {
+    fn handle_abort_message(&mut self, AbortMessage { bank_id }: AbortMessage) {
+        let Some(block_verification_state) = self.block_verification_state_mut(bank_id) else {
             // The block completed or failed verification before the abort message arrived
-            return Ok(());
+            return;
         };
 
         // A block that already failed verification keeps the failure as its outcome
         if block_verification_state.tracking_state == BlockTrackingState::InProgress {
             block_verification_state.tracking_state = BlockTrackingState::Aborted;
         }
-
-        self.try_release_block(block_verification_state)
     }
 
     fn handle_all_entries_submitted_message(
         &mut self,
         AllEntriesSubmittedMessage { bank_id }: AllEntriesSubmittedMessage,
-    ) -> Result<(), DisconnectedResponseChannel> {
-        let Some(mut block_verification_state) = self.take_block_verification_state(&bank_id)
-        else {
+    ) {
+        let Some(block_verification_state) = self.block_verification_state_mut(bank_id) else {
             // The block already failed verification
-            return Ok(());
+            return;
         };
 
         block_verification_state
             .progress_tracker
             .all_entries_are_submitted = true;
-
-        self.try_release_block(block_verification_state)
     }
 
     fn handle_entry_hash_verification_response(
         &mut self,
         EntryHashVerificationResponse { bank_id, verified }: EntryHashVerificationResponse,
-    ) -> Result<(), DisconnectedResponseChannel> {
+    ) {
         self.entry_hash_verification_queue.complete_request();
 
-        let mut block_verification_state = self
-            .take_block_verification_state(&bank_id)
+        let block_verification_state = self
+            .block_verification_state_mut(bank_id)
             .expect("a block is only released once none of its requests are in flight");
 
         let progress_tracker = &mut block_verification_state.progress_tracker;
@@ -507,18 +505,16 @@ impl BlockVerificationScheduler {
             block_verification_state.tracking_state =
                 BlockTrackingState::Invalidated(VerificationFailureReason::InvalidEntryHash);
         }
-
-        self.try_release_block(block_verification_state)
     }
 
     fn handle_signature_verification_response(
         &mut self,
         SignatureVerificationResponse { bank_id, verified }: SignatureVerificationResponse,
-    ) -> Result<(), DisconnectedResponseChannel> {
+    ) {
         self.signature_verification_queue.complete_request();
 
-        let mut block_verification_state = self
-            .take_block_verification_state(&bank_id)
+        let block_verification_state = self
+            .block_verification_state_mut(bank_id)
             .expect("a block is only released once none of its requests are in flight");
 
         let progress_tracker = &mut block_verification_state.progress_tracker;
@@ -532,18 +528,16 @@ impl BlockVerificationScheduler {
             block_verification_state.tracking_state =
                 BlockTrackingState::Invalidated(VerificationFailureReason::InvalidSignature);
         }
-
-        self.try_release_block(block_verification_state)
     }
 
     fn handle_transaction_check_response(
         &mut self,
         TransactionCheckResponse { bank_id, result }: TransactionCheckResponse,
-    ) -> Result<(), DisconnectedResponseChannel> {
+    ) {
         self.transaction_check_queue.complete_request();
 
-        let mut block_verification_state = self
-            .take_block_verification_state(&bank_id)
+        let block_verification_state = self
+            .block_verification_state_mut(bank_id)
             .expect("a block is only released once none of its requests are in flight");
 
         let progress_tracker = &mut block_verification_state.progress_tracker;
@@ -565,44 +559,15 @@ impl BlockVerificationScheduler {
                 }
             };
         }
-
-        self.try_release_block(block_verification_state)
     }
 
-    /// Takes the state of the block being verified in `bank_id` out of the scheduler state.
-    fn take_block_verification_state(
+    fn block_verification_state_mut(
         &mut self,
-        bank_id: &BankId,
-    ) -> Option<BlockVerificationState> {
-        let block_verification_state_index = self
-            .blocks_in_progress
-            .iter()
-            .position(|state| state.bank_id == *bank_id)?;
-
-        Some(
-            self.blocks_in_progress
-                .swap_remove(block_verification_state_index),
-        )
-    }
-
-    /// Sends the outcome of the block back to replay once it has one, and returns its state to the
-    /// scheduler otherwise.
-    fn try_release_block(
-        &mut self,
-        block_verification_state: BlockVerificationState,
-    ) -> Result<(), DisconnectedResponseChannel> {
-        let Some(verification_status) = block_verification_state.release_outcome() else {
-            self.blocks_in_progress.push(block_verification_state);
-            return Ok(());
-        };
-
-        self.buffered_replay_response_messages
-            .push_back(BlockVerificationToReplayMessage {
-                slot: block_verification_state.slot,
-                bank_id: block_verification_state.bank_id,
-                verification_status,
-            });
-        self.try_flush_buffered_replay_responses()
+        bank_id: BankId,
+    ) -> Option<&mut BlockVerificationState> {
+        self.blocks_in_progress
+            .iter_mut()
+            .find(|state| state.bank_id == bank_id)
     }
 }
 
@@ -696,6 +661,7 @@ mod tests {
     const TRANSACTION_CHECK_QUEUE_SIZE: usize = 6;
     const OUTCOME_CHANNEL_SIZE: usize = 64;
 
+    /// Flushes the completed blocks after every handler call, like the event loop.
     struct ManuallyDrivenScheduler {
         scheduler: BlockVerificationScheduler,
         entry_hash_verification_request_consumer: mpmc::Consumer<EntryHashVerificationRequest>,
@@ -777,7 +743,8 @@ mod tests {
                 self.scheduler.workers_can_accept_request(),
                 "the event loop does not receive replay messages while a request queue is full"
             );
-            self.scheduler.handle_replay_message(message).unwrap();
+            self.scheduler.handle_replay_message(message);
+            self.scheduler.try_flush_completed_blocks().unwrap();
         }
 
         /// Answers the oldest request in the queue
@@ -790,8 +757,8 @@ mod tests {
                 .handle_entry_hash_verification_response(EntryHashVerificationResponse {
                     bank_id: request.bank_id,
                     verified,
-                })
-                .unwrap();
+                });
+            self.scheduler.try_flush_completed_blocks().unwrap();
         }
 
         /// Answers the oldest request in the queue
@@ -804,8 +771,8 @@ mod tests {
                 .handle_signature_verification_response(SignatureVerificationResponse {
                     bank_id: request.bank_id,
                     verified,
-                })
-                .unwrap();
+                });
+            self.scheduler.try_flush_completed_blocks().unwrap();
         }
 
         /// Answers the oldest request in the queue
@@ -818,8 +785,8 @@ mod tests {
                 .handle_transaction_check_response(TransactionCheckResponse {
                     bank_id: request.bank_id,
                     result,
-                })
-                .unwrap();
+                });
+            self.scheduler.try_flush_completed_blocks().unwrap();
         }
 
         fn try_recv_outcome(&self) -> Option<BlockVerificationToReplayMessage> {

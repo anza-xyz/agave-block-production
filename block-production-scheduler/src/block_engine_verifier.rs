@@ -18,6 +18,13 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_BUNDLE_MEMBERS: usize = 5;
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "payloads are consumed by upcoming ingress handling"
+    )
+)]
 pub(crate) enum VerifiedMessage {
     Packets(PacketBatch),
     Bundle(PacketBatch),

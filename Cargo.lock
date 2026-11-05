@@ -123,6 +123,7 @@ dependencies = [
  "solana-keypair",
  "solana-message",
  "solana-metrics",
+ "solana-perf",
  "solana-pubkey 4.4.0",
  "solana-signature",
  "solana-svm-transaction",

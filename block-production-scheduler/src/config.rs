@@ -19,6 +19,9 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     pub session: SessionConfig,
     pub scheduler: SchedulerConfig,
+    /// Block engine to receive packets and bundles from. Omit to run without one.
+    #[serde(default)]
+    pub block_engine: Option<BlockEngineConfig>,
 }
 
 impl Config {
@@ -118,6 +121,24 @@ impl Default for SchedulerConfig {
             .try_into()
             .expect("embedded scheduler defaults are valid")
     }
+}
+
+/// Connection to a block engine. Has no embedded defaults, so the client only
+/// runs when the user's TOML file has a `[block_engine]` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockEngineConfig {
+    /// Block engine URL.
+    pub url: String,
+    /// Keypair file of the validator identity used to authenticate.
+    pub keypair_path: PathBuf,
+    /// Block-engine-to-scheduler queue capacity in messages.
+    #[serde(default = "default_block_engine_to_pack_capacity")]
+    pub block_engine_to_pack_capacity: usize,
+}
+
+const fn default_block_engine_to_pack_capacity() -> usize {
+    1024
 }
 
 fn defaults() -> toml::Table {

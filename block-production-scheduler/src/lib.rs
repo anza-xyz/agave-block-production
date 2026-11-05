@@ -3,12 +3,12 @@
 
 use {
     crate::{
-        check_response::TransactionState, in_flight_tracker::InFlightTracker,
-        leader_slot_metrics::LeaderSlotMetrics, progress_tracker::SchedulerState,
-        schedule::SchedulerScratch, scheduling_details::SchedulingDetails,
-        transaction_container::TransactionContainer,
+        block_engine_verifier::VerifiedMessage, check_response::TransactionState,
+        in_flight_tracker::InFlightTracker, leader_slot_metrics::LeaderSlotMetrics,
+        progress_tracker::SchedulerState, schedule::SchedulerScratch,
+        scheduling_details::SchedulingDetails, transaction_container::TransactionContainer,
     },
-    agave_block_engine_client::{BlockEngineClient, BlockEngineClientConfig, BlockEngineMessage},
+    agave_block_engine_client::{BlockEngineClient, BlockEngineClientConfig},
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_scheduler_bindings::{
         CheckWorkerToPackMessage, PackToCheckWorkerMessage, ProgressMessage, TpuToPackMessage,
@@ -42,13 +42,6 @@ use {
 
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the verifier is spawned by upcoming block engine wiring"
-    )
-)]
 mod block_engine_verifier;
 mod check_response;
 mod config;
@@ -118,7 +111,7 @@ struct Scheduler {
         dead_code,
         reason = "block engine messages are consumed by upcoming ingress handling"
     )]
-    block_engine: Receiver<BlockEngineMessage>,
+    block_engine: Receiver<VerifiedMessage>,
 }
 
 impl Scheduler {
@@ -131,7 +124,7 @@ impl Scheduler {
         max_cost_units_per_worker: u64,
         max_cost_units_per_batch: u64,
         target_entry_bytes_per_batch: u64,
-        block_engine: Receiver<BlockEngineMessage>,
+        block_engine: Receiver<VerifiedMessage>,
     ) -> Result<Self, ClientHandshakeError> {
         let ClientSession {
             allocator,
@@ -282,25 +275,38 @@ fn load_block_engine(
         .transpose()
 }
 
-/// Spawns the block engine client, if configured, returning the receiver the scheduler drains
-/// and the handle that stops the client. Without a block engine the receiver never yields.
+/// Spawns the block engine client and verifier, if configured, returning the receiver the
+/// scheduler drains and the handle that stops both. Without a block engine the receiver never
+/// yields.
 fn spawn_block_engine(
     block_engine: Option<(BlockEngineConfig, Keypair)>,
-) -> Result<(Receiver<BlockEngineMessage>, BlockEngineHandle), SchedulerError> {
+) -> Result<(Receiver<VerifiedMessage>, BlockEngineHandle), SchedulerError> {
     let Some((config, identity)) = block_engine else {
         return Ok((crossbeam_channel::never(), BlockEngineHandle::Off));
     };
-    let (sender, receiver) = crossbeam_channel::bounded(config.block_engine_to_pack_capacity);
+    let (client_sender, verifier_receiver) =
+        crossbeam_channel::bounded(config.block_engine_to_pack_capacity);
+    let (verifier_sender, receiver) =
+        crossbeam_channel::bounded(config.block_engine_to_pack_capacity);
+    let verifier = block_engine_verifier::spawn_verifier(verifier_receiver, verifier_sender)
+        .map_err(SchedulerError::BlockEngineSpawn)?;
     let cancel = CancellationToken::new();
-    let thread = BlockEngineClient::new(
+    let client = BlockEngineClient::new(
         config.url,
         identity,
-        sender,
+        client_sender,
         BlockEngineClientConfig::default(),
     )
     .spawn(cancel.clone())
     .map_err(SchedulerError::BlockEngineSpawn)?;
-    Ok((receiver, BlockEngineHandle::Running { cancel, thread }))
+    Ok((
+        receiver,
+        BlockEngineHandle::Running {
+            cancel,
+            client,
+            verifier,
+        },
+    ))
 }
 
 #[derive(Debug)]
@@ -308,18 +314,27 @@ enum BlockEngineHandle {
     Off,
     Running {
         cancel: CancellationToken,
-        thread: JoinHandle<()>,
+        client: JoinHandle<()>,
+        verifier: JoinHandle<()>,
     },
 }
 
 impl BlockEngineHandle {
     fn stop(self) {
-        let Self::Running { cancel, thread } = self else {
+        let Self::Running {
+            cancel,
+            client,
+            verifier,
+        } = self
+        else {
             return;
         };
         cancel.cancel();
-        if thread.join().is_err() {
+        if client.join().is_err() {
             warn!("Block engine client thread panicked");
+        }
+        if verifier.join().is_err() {
+            warn!("Block engine verifier thread panicked");
         }
     }
 }
@@ -344,7 +359,7 @@ fn run_scheduler(
     session: ClientSession,
     config: SchedulerConfig,
     check_response_capacity: usize,
-    block_engine: Receiver<BlockEngineMessage>,
+    block_engine: Receiver<VerifiedMessage>,
     exit: &AtomicBool,
 ) -> Result<(), ClientHandshakeError> {
     let worker_count = session.workers.len();

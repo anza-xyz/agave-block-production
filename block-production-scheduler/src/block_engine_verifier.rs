@@ -18,6 +18,13 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_BUNDLE_MEMBERS: usize = 5;
 
 #[derive(Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "payloads are consumed by upcoming ingress handling"
+    )
+)]
 pub(crate) enum VerifiedMessage {
     Packets(PacketBatch),
     Bundle(PacketBatch),
@@ -393,20 +400,20 @@ mod tests {
 
     #[test]
     fn exits_when_downstream_disconnects() {
-        let (upstream, receiver) = unbounded();
-        let (sender, downstream) = unbounded();
-        let verifier = spawn_verifier(receiver, sender).unwrap();
-        drop(downstream);
+        let messages: [fn() -> BlockEngineMessage; 2] = [
+            || BlockEngineMessage::Packets(batch(vec![valid()])),
+            || BlockEngineMessage::Bundles(vec![bundle(vec![valid()]), bundle(vec![valid()])]),
+        ];
+        for message in messages {
+            let (upstream, receiver) = unbounded();
+            let (sender, downstream) = unbounded();
+            let verifier = spawn_verifier(receiver, sender).unwrap();
+            drop(downstream);
 
-        upstream
-            .send(BlockEngineMessage::Packets(batch(vec![valid()])))
-            .unwrap();
-        verifier.join().unwrap();
+            upstream.send(message()).unwrap();
+            verifier.join().unwrap();
 
-        assert!(
-            upstream
-                .send(BlockEngineMessage::Packets(batch(vec![valid()])))
-                .is_err()
-        );
+            assert!(upstream.send(message()).is_err());
+        }
     }
 }

@@ -8,6 +8,7 @@ use {
         schedule::SchedulerScratch, scheduling_details::SchedulingDetails,
         transaction_container::TransactionContainer,
     },
+    agave_block_engine_client::{BlockEngineClient, BlockEngineClientConfig, BlockEngineMessage},
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_scheduler_bindings::{
         CheckWorkerToPackMessage, PackToCheckWorkerMessage, ProgressMessage, TpuToPackMessage,
@@ -22,11 +23,21 @@ use {
         sync::atomic::{AtomicBool, Ordering},
         time::Duration,
     },
-    log::{debug, info},
+    crossbeam_channel::Receiver,
+    log::{debug, info, warn},
     rts_alloc::Allocator,
     solana_clock::Slot,
+    solana_keypair::{Keypair, read_keypair_file},
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
-    std::{collections::HashSet, io::ErrorKind, thread, time::Instant},
+    std::{
+        collections::HashSet,
+        io::{self, ErrorKind},
+        path::PathBuf,
+        thread::{self, JoinHandle},
+        time::Instant,
+    },
+    thiserror::Error,
+    tokio_util::sync::CancellationToken,
 };
 
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -54,6 +65,16 @@ mod transaction_container;
 mod tests;
 
 pub use config::{BlockEngineConfig, Config, SchedulerConfig, SessionConfig};
+
+#[derive(Debug, Error)]
+pub enum SchedulerError {
+    #[error(transparent)]
+    Handshake(#[from] ClientHandshakeError),
+    #[error("failed to read block engine keypair {}: {err}", path.display())]
+    BlockEngineKeypair { path: PathBuf, err: String },
+    #[error("failed to spawn block engine client: {0}")]
+    BlockEngineSpawn(io::Error),
+}
 
 struct Scheduler {
     state: SchedulerState,
@@ -85,6 +106,11 @@ struct Scheduler {
     max_cost_units_per_worker: u64,
     max_cost_units_per_batch: u64,
     target_entry_bytes_per_batch: u64,
+    #[expect(
+        dead_code,
+        reason = "block engine messages are consumed by upcoming ingress handling"
+    )]
+    block_engine: Receiver<BlockEngineMessage>,
 }
 
 impl Scheduler {
@@ -97,6 +123,7 @@ impl Scheduler {
         max_cost_units_per_worker: u64,
         max_cost_units_per_batch: u64,
         target_entry_bytes_per_batch: u64,
+        block_engine: Receiver<BlockEngineMessage>,
     ) -> Result<Self, ClientHandshakeError> {
         let ClientSession {
             allocator,
@@ -138,6 +165,7 @@ impl Scheduler {
             max_cost_units_per_batch,
             target_entry_bytes_per_batch,
             workers,
+            block_engine,
         })
     }
 
@@ -205,17 +233,23 @@ impl Scheduler {
 ///
 /// The exit flag cannot interrupt an in-progress handshake. The timeout has the syscall-level
 /// semantics of [`client::connect`], rather than imposing a deadline on the entire handshake.
-pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError> {
+pub fn run(mut config: Config, exit: &AtomicBool) -> Result<(), SchedulerError> {
+    let block_engine = load_block_engine(config.block_engine.take())?;
+
     info!("Waiting for Agave at {}", config.ipc_path.display());
     while !exit.load(Ordering::Relaxed) {
         if let Some(session) = try_connect(&config)? {
             info!("Connected to Agave at {}", config.ipc_path.display());
-            return run_session(
+            let (receiver, client) = spawn_block_engine(block_engine)?;
+            let result = run_scheduler(
                 session,
                 config.scheduler,
                 config.session.check_worker_to_pack_capacity,
+                receiver,
                 exit,
             );
+            client.stop();
+            return result.map_err(Into::into);
         }
         thread::sleep(CONNECTION_RETRY_INTERVAL);
     }
@@ -223,11 +257,86 @@ pub fn run(config: Config, exit: &AtomicBool) -> Result<(), ClientHandshakeError
     Ok(())
 }
 
+/// Reads the block engine identity up front so a bad keypair fails at startup.
+fn load_block_engine(
+    config: Option<BlockEngineConfig>,
+) -> Result<Option<(BlockEngineConfig, Keypair)>, SchedulerError> {
+    config
+        .map(|config| {
+            let identity = read_keypair_file(&config.keypair_path).map_err(|err| {
+                SchedulerError::BlockEngineKeypair {
+                    path: config.keypair_path.clone(),
+                    err: err.to_string(),
+                }
+            })?;
+            Ok((config, identity))
+        })
+        .transpose()
+}
+
+/// Spawns the block engine client, if configured, returning the receiver the scheduler drains
+/// and the handle that stops the client. Without a block engine the receiver never yields.
+fn spawn_block_engine(
+    block_engine: Option<(BlockEngineConfig, Keypair)>,
+) -> Result<(Receiver<BlockEngineMessage>, BlockEngineHandle), SchedulerError> {
+    let Some((config, identity)) = block_engine else {
+        return Ok((crossbeam_channel::never(), BlockEngineHandle::Off));
+    };
+    let (sender, receiver) = crossbeam_channel::bounded(config.block_engine_to_pack_capacity);
+    let cancel = CancellationToken::new();
+    let thread = BlockEngineClient::new(
+        config.url,
+        identity,
+        sender,
+        BlockEngineClientConfig::default(),
+    )
+    .spawn(cancel.clone())
+    .map_err(SchedulerError::BlockEngineSpawn)?;
+    Ok((receiver, BlockEngineHandle::Running { cancel, thread }))
+}
+
+#[derive(Debug)]
+enum BlockEngineHandle {
+    Off,
+    Running {
+        cancel: CancellationToken,
+        thread: JoinHandle<()>,
+    },
+}
+
+impl BlockEngineHandle {
+    fn stop(self) {
+        let Self::Running { cancel, thread } = self else {
+            return;
+        };
+        cancel.cancel();
+        if thread.join().is_err() {
+            warn!("Block engine client thread panicked");
+        }
+    }
+}
+
 /// Runs the scheduler on the calling thread using an established local or external session.
 pub fn run_session(
     session: ClientSession,
     config: SchedulerConfig,
     check_response_capacity: usize,
+    exit: &AtomicBool,
+) -> Result<(), ClientHandshakeError> {
+    run_scheduler(
+        session,
+        config,
+        check_response_capacity,
+        crossbeam_channel::never(),
+        exit,
+    )
+}
+
+fn run_scheduler(
+    session: ClientSession,
+    config: SchedulerConfig,
+    check_response_capacity: usize,
+    block_engine: Receiver<BlockEngineMessage>,
     exit: &AtomicBool,
 ) -> Result<(), ClientHandshakeError> {
     let worker_count = session.workers.len();
@@ -240,6 +349,7 @@ pub fn run_session(
         config.max_cost_units_per_worker,
         config.max_cost_units_per_batch,
         config.target_entry_bytes_per_batch,
+        block_engine,
     )?;
 
     info!("Scheduler running with {worker_count} execution workers");

@@ -103,6 +103,7 @@ dependencies = [
 name = "agave-block-production-scheduler"
 version = "4.5.0-alpha.4"
 dependencies = [
+ "agave-block-engine-client",
  "agave-logger",
  "agave-reserved-account-keys",
  "agave-scheduler-bindings",
@@ -110,6 +111,7 @@ dependencies = [
  "agave-scheduling-utils",
  "agave-transaction-view",
  "clap 2.33.3",
+ "crossbeam-channel",
  "log",
  "rts-alloc",
  "serde",
@@ -118,6 +120,7 @@ dependencies = [
  "slab",
  "solana-clock",
  "solana-hash",
+ "solana-keypair",
  "solana-message",
  "solana-metrics",
  "solana-pubkey 4.4.0",
@@ -125,7 +128,9 @@ dependencies = [
  "solana-svm-transaction",
  "solana-transaction",
  "tempfile",
+ "thiserror 2.0.21",
  "tikv-jemallocator",
+ "tokio-util 0.7.19",
  "toml 1.1.7+spec-1.1.0",
  "wincode",
 ]

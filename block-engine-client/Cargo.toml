@@ -28,12 +28,13 @@ solana-pubkey = { workspace = true }
 solana-signer = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots", "tls-ring"] }
 
 [dev-dependencies]
-hyper-util = { workspace = true, features = ["server-auto", "service", "tokio"] }
 solana-signature = { workspace = true, features = ["verify"] }
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

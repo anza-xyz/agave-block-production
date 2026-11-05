@@ -75,7 +75,6 @@ version = "4.5.0-alpha.4"
 dependencies = [
  "agave-block-engine-proto",
  "crossbeam-channel",
- "hyper-util",
  "log",
  "solana-keypair",
  "solana-perf",
@@ -84,6 +83,8 @@ dependencies = [
  "solana-signer",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-stream",
+ "tokio-util 0.7.19",
  "tonic",
 ]
 
@@ -3671,7 +3672,6 @@ dependencies = [
  "http 1.5.0",
  "http-body 1.0.1",
  "httparse",
- "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",

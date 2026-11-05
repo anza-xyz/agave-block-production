@@ -19,17 +19,14 @@ use {
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     std::{
-        convert::Infallible,
         io,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
         thread::{self, JoinHandle},
-        time::{Duration, SystemTime},
+        time::Duration,
     },
     thiserror::Error,
-    tokio::{runtime::Runtime, time},
+    tokio::time,
+    tokio_stream::{Stream, StreamExt},
+    tokio_util::sync::CancellationToken,
     tonic::{
         Request, Status, Streaming,
         metadata::{AsciiMetadataValue, errors::InvalidMetadataValue},
@@ -37,22 +34,35 @@ use {
     },
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = if cfg!(test) {
-    Duration::from_millis(200)
-} else {
-    Duration::from_secs(5)
-};
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const TCP_KEEPALIVE_RETRIES: u32 = 3;
-const RECONNECT_BACKOFF: Duration = if cfg!(test) {
-    Duration::from_millis(100)
-} else {
-    Duration::from_secs(5)
-};
-const TOKEN_REFRESH_SLACK: Duration = Duration::from_secs(60);
-const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Timeouts and intervals used by [`BlockEngineClient`].
+#[derive(Clone, Debug)]
+pub struct BlockEngineClientConfig {
+    /// Timeout for establishing the connection.
+    pub connect_timeout: Duration,
+    /// Timeout for each request.
+    pub request_timeout: Duration,
+    /// Idle time before TCP keepalive probes start.
+    pub tcp_keepalive: Duration,
+    /// Interval between TCP keepalive probes.
+    pub tcp_keepalive_interval: Duration,
+    /// Unanswered TCP keepalive probes before the connection is dropped.
+    pub tcp_keepalive_retries: u32,
+    /// Delay before reconnecting after a failed session.
+    pub reconnect_backoff: Duration,
+}
+
+impl Default for BlockEngineClientConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(5),
+            tcp_keepalive: Duration::from_secs(60),
+            tcp_keepalive_interval: Duration::from_secs(10),
+            tcp_keepalive_retries: 3,
+            reconnect_backoff: Duration::from_secs(5),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 enum SessionError {
@@ -62,14 +72,8 @@ enum SessionError {
     Status(#[from] Status),
     #[error("auth response has no access token")]
     MissingAccessToken,
-    #[error("access token has no valid expiry")]
-    MissingExpiry,
-    #[error("access token already expired")]
-    ExpiredAccessToken,
     #[error("invalid access token: {0}")]
     InvalidAccessToken(#[from] InvalidMetadataValue),
-    #[error("packet stream closed")]
-    StreamClosed,
     #[error("packet receiver disconnected")]
     ReceiverDisconnected,
 }
@@ -119,97 +123,93 @@ pub struct BlockEngineClient {
     url: String,
     identity: Keypair,
     packet_sender: Sender<PacketBatch>,
+    config: BlockEngineClientConfig,
 }
 
 impl BlockEngineClient {
-    pub fn new(url: String, identity: Keypair, packet_sender: Sender<PacketBatch>) -> Self {
+    pub fn new(
+        url: String,
+        identity: Keypair,
+        packet_sender: Sender<PacketBatch>,
+        config: BlockEngineClientConfig,
+    ) -> Self {
         Self {
             url,
             identity,
             packet_sender,
+            config,
         }
     }
 
-    /// Runs the client on its own thread until `exit` is set or the packet
+    /// Runs the client on its own thread until `cancel` is cancelled or the packet
     /// receiver is dropped.
-    pub fn spawn(self, exit: Arc<AtomicBool>) -> io::Result<JoinHandle<()>> {
+    pub fn spawn(self, cancel: CancellationToken) -> io::Result<JoinHandle<()>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         thread::Builder::new()
             .name("solBlkEngClient".into())
-            .spawn(move || self.run(&runtime, &exit))
+            .spawn(move || {
+                runtime.block_on(cancel.run_until_cancelled_owned(self.run()));
+            })
     }
 
-    fn run(&self, runtime: &Runtime, exit: &AtomicBool) {
-        runtime.block_on(async {
-            loop {
-                let Err(err) = tokio::select! {
-                    result = self.run_session() => result,
-                    () = wait_for_exit(exit) => return,
-                };
-                if let SessionError::ReceiverDisconnected = err {
+    /// Runs sessions until the packet receiver is dropped, reconnecting after
+    /// the stream closes or any other failure.
+    async fn run(&self) {
+        self.reconnect_loop(|| self.run_session()).await;
+    }
+
+    /// Runs `session` repeatedly until it fails with `ReceiverDisconnected`,
+    /// waiting `reconnect_backoff` after every other outcome.
+    async fn reconnect_loop<F, Fut>(&self, mut session: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<(), SessionError>>,
+    {
+        loop {
+            match session().await {
+                Ok(()) => info!("Block engine {} closed the packet stream", self.url),
+                Err(SessionError::ReceiverDisconnected) => {
                     info!("Block engine packet receiver disconnected, stopping client");
                     return;
                 }
-                warn!("Block engine session with {} failed: {err}", self.url);
-                tokio::select! {
-                    () = time::sleep(RECONNECT_BACKOFF) => {}
-                    () = wait_for_exit(exit) => return,
-                }
+                Err(err) => warn!("Block engine session with {} failed: {err}", self.url),
             }
-        });
+            time::sleep(self.config.reconnect_backoff).await;
+        }
     }
 
-    async fn run_session(&self) -> Result<Infallible, SessionError> {
-        let channel = connect(&self.url).await?;
-        let mut auth = AuthServiceClient::new(channel.clone());
-        let mut validator = BlockEngineValidatorClient::new(channel);
-        let (mut packets, refresh_delay) = self.subscribe(&mut auth, &mut validator).await?;
+    async fn run_session(&self) -> Result<(), SessionError> {
+        let channel = connect(&self.url, &self.config).await?;
+        let packets = self.subscribe(channel).await?;
         info!("Subscribed to block engine {} packets", self.url);
-        let refresh = time::sleep(refresh_delay);
-        tokio::pin!(refresh);
+        self.consume(packets).await
+    }
 
-        loop {
-            tokio::select! {
-                message = packets.message() => match message? {
-                    Some(response) => self.forward(response)?,
-                    None => return Err(SessionError::StreamClosed),
-                },
-                () = &mut refresh => {
-                    // The token is only checked when a subscription starts, so
-                    // refreshing it means subscribing again. Keep the current
-                    // stream if that fails.
-                    let refresh_delay = match self.subscribe(&mut auth, &mut validator).await {
-                        Ok((resubscribed, refresh_delay)) => {
-                            debug!("Resubscribed to block engine packets with a new token");
-                            packets = resubscribed;
-                            refresh_delay
-                        }
-                        Err(err) => {
-                            warn!("Failed to refresh block engine subscription: {err}");
-                            RECONNECT_BACKOFF
-                        }
-                    };
-                    refresh.set(time::sleep(refresh_delay));
-                }
-            }
+    /// Forwards packets from `packets` until the stream ends (`Ok`) or fails.
+    async fn consume(
+        &self,
+        mut packets: impl Stream<Item = Result<SubscribePacketsResponse, Status>> + Unpin,
+    ) -> Result<(), SessionError> {
+        while let Some(response) = packets.next().await {
+            self.forward(response?)?;
         }
+        Ok(())
     }
 
     async fn subscribe(
         &self,
-        auth: &mut AuthServiceClient<Channel>,
-        validator: &mut BlockEngineValidatorClient<Channel>,
-    ) -> Result<(Streaming<SubscribePacketsResponse>, Duration), SessionError> {
-        let access_token = authenticate(auth, &self.identity).await?;
-        let refresh_delay = access_token.refresh_delay()?;
+        channel: Channel,
+    ) -> Result<Streaming<SubscribePacketsResponse>, SessionError> {
+        let access_token =
+            authenticate(&mut AuthServiceClient::new(channel.clone()), &self.identity).await?;
         let mut request = Request::new(SubscribePacketsRequest {});
-        request
-            .metadata_mut()
-            .insert("authorization", access_token.value);
-        let packets = validator.subscribe_packets(request).await?.into_inner();
-        Ok((packets, refresh_delay))
+        request.metadata_mut().insert("authorization", access_token);
+        Ok(BlockEngineValidatorClient::new(channel)
+            .subscribe_packets(request)
+            .await?
+            .into_inner())
     }
 
     fn forward(&self, response: SubscribePacketsResponse) -> Result<(), SessionError> {
@@ -238,38 +238,17 @@ impl BlockEngineClient {
     }
 }
 
-struct AccessToken {
-    value: AsciiMetadataValue,
-    expires_at: Option<SystemTime>,
+fn bearer(token: Token) -> Result<AsciiMetadataValue, SessionError> {
+    Ok(format!("Bearer {}", token.value).parse()?)
 }
 
-impl AccessToken {
-    fn refresh_delay(&self) -> Result<Duration, SessionError> {
-        let expires_at = self.expires_at.ok_or(SessionError::MissingExpiry)?;
-        refresh_delay(expires_at, SystemTime::now()).ok_or(SessionError::ExpiredAccessToken)
-    }
-}
-
-impl TryFrom<Token> for AccessToken {
-    type Error = SessionError;
-
-    fn try_from(token: Token) -> Result<Self, Self::Error> {
-        Ok(Self {
-            value: format!("Bearer {}", token.value).parse()?,
-            expires_at: token
-                .expires_at_utc
-                .and_then(|expires_at| SystemTime::try_from(expires_at).ok()),
-        })
-    }
-}
-
-async fn connect(url: &str) -> Result<Channel, SessionError> {
+async fn connect(url: &str, config: &BlockEngineClientConfig) -> Result<Channel, SessionError> {
     let mut endpoint = Endpoint::from_shared(url.to_owned())?
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .tcp_keepalive(Some(TCP_KEEPALIVE))
-        .tcp_keepalive_interval(Some(TCP_KEEPALIVE_INTERVAL))
-        .tcp_keepalive_retries(Some(TCP_KEEPALIVE_RETRIES));
+        .connect_timeout(config.connect_timeout)
+        .timeout(config.request_timeout)
+        .tcp_keepalive(Some(config.tcp_keepalive))
+        .tcp_keepalive_interval(Some(config.tcp_keepalive_interval))
+        .tcp_keepalive_retries(Some(config.tcp_keepalive_retries));
     if endpoint.uri().scheme_str() == Some("https") {
         endpoint = endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?;
     }
@@ -279,7 +258,7 @@ async fn connect(url: &str) -> Result<Channel, SessionError> {
 async fn authenticate(
     auth: &mut AuthServiceClient<Channel>,
     identity: &Keypair,
-) -> Result<AccessToken, SessionError> {
+) -> Result<AsciiMetadataValue, SessionError> {
     let pubkey = identity.pubkey();
     let challenge = auth
         .generate_auth_challenge(GenerateAuthChallengeRequest {
@@ -289,43 +268,32 @@ async fn authenticate(
         .await?
         .into_inner()
         .challenge;
-    let challenge = challenge_message(&pubkey, &challenge);
-    let signed_challenge = identity.sign_message(challenge.as_bytes());
     let tokens = auth
-        .generate_auth_tokens(GenerateAuthTokensRequest {
-            challenge,
-            client_pubkey: pubkey.to_bytes().to_vec(),
-            signed_challenge: signed_challenge.as_ref().to_vec(),
-        })
+        .generate_auth_tokens(auth_tokens_request(identity, &challenge))
         .await?
         .into_inner();
-    tokens
-        .access_token
-        .ok_or(SessionError::MissingAccessToken)?
-        .try_into()
+    bearer(
+        tokens
+            .access_token
+            .ok_or(SessionError::MissingAccessToken)?,
+    )
+}
+
+/// Builds the token request answering `challenge`, signed by `identity`.
+fn auth_tokens_request(identity: &Keypair, challenge: &str) -> GenerateAuthTokensRequest {
+    let pubkey = identity.pubkey();
+    let challenge = challenge_message(&pubkey, challenge);
+    let signed_challenge = identity.sign_message(challenge.as_bytes());
+    GenerateAuthTokensRequest {
+        challenge,
+        client_pubkey: pubkey.to_bytes().to_vec(),
+        signed_challenge: signed_challenge.as_ref().to_vec(),
+    }
 }
 
 fn challenge_message(pubkey: &Pubkey, challenge: &str) -> String {
     format!("{pubkey}-{challenge}")
 }
-
-fn refresh_delay(expires_at: SystemTime, now: SystemTime) -> Option<Duration> {
-    let remaining = expires_at
-        .duration_since(now)
-        .ok()
-        .filter(|remaining| !remaining.is_zero())?;
-    let half = remaining.checked_div(2).unwrap_or_default();
-    Some(remaining.saturating_sub(TOKEN_REFRESH_SLACK).max(half))
-}
-
-async fn wait_for_exit(exit: &AtomicBool) {
-    while !exit.load(Ordering::Relaxed) {
-        time::sleep(EXIT_POLL_INTERVAL).await;
-    }
-}
-
-#[cfg(test)]
-mod client_tests;
 
 #[cfg(test)]
 mod tests {
@@ -336,15 +304,27 @@ mod tests {
         },
         crossbeam_channel::{Receiver, TryRecvError, bounded},
         solana_perf::packet::bytes::Bytes,
+        solana_signature::Signature,
         std::{
             assert_matches,
+            collections::VecDeque,
             net::{IpAddr, Ipv4Addr, Ipv6Addr},
         },
+        tokio::time::Instant,
+        tokio_util::sync::CancellationToken,
     };
+
+    const BACKOFF: Duration = Duration::from_secs(5);
+    const HALF_BACKOFF: Duration = Duration::from_millis(2500);
 
     fn client(capacity: usize) -> (BlockEngineClient, Receiver<PacketBatch>) {
         let (sender, receiver) = bounded(capacity);
-        let client = BlockEngineClient::new("http://localhost".into(), Keypair::new(), sender);
+        let client = BlockEngineClient::new(
+            "http://localhost".into(),
+            Keypair::new(),
+            sender,
+            BlockEngineClientConfig::default(),
+        );
         (client, receiver)
     }
 
@@ -491,50 +471,23 @@ mod tests {
     }
 
     #[test]
-    fn signed_challenge_verifies_against_identity() {
+    fn auth_tokens_request_signs_challenge_with_identity() {
         let identity = Keypair::new();
         let pubkey = identity.pubkey();
-        let message = challenge_message(&pubkey, "challenge");
-        assert_eq!(message, format!("{pubkey}-challenge"));
-        let signature = identity.sign_message(message.as_bytes());
-        assert!(signature.verify(pubkey.as_ref(), message.as_bytes()));
+        let request = auth_tokens_request(&identity, "challenge");
+        assert_eq!(request.challenge, format!("{pubkey}-challenge"));
+        assert_eq!(request.client_pubkey, pubkey.to_bytes());
+        let signature = Signature::try_from(request.signed_challenge.as_slice()).unwrap();
+        assert!(signature.verify(pubkey.as_ref(), request.challenge.as_bytes()));
     }
 
     #[test]
-    fn refresh_delay_leaves_slack_before_expiry() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        let hour = Duration::from_secs(3600);
-        assert_eq!(
-            refresh_delay(now + hour, now),
-            Some(hour - TOKEN_REFRESH_SLACK)
-        );
-    }
-
-    #[test]
-    fn refresh_delay_uses_half_of_short_lifetimes() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        assert_eq!(
-            refresh_delay(now + Duration::from_secs(30), now),
-            Some(Duration::from_secs(15))
-        );
-    }
-
-    #[test]
-    fn refresh_delay_rejects_expired_tokens() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-        assert_eq!(refresh_delay(now, now), None);
-        assert_eq!(refresh_delay(now - Duration::from_secs(1), now), None);
-    }
-
-    #[test]
-    fn access_token_requires_expiry() {
-        let token = AccessToken::try_from(Token {
+    fn bearer_prefixes_token() {
+        let token = Token {
             value: "token".into(),
             expires_at_utc: None,
-        })
-        .unwrap();
-        assert_eq!(token.value, "Bearer token");
-        assert_matches!(token.refresh_delay(), Err(SessionError::MissingExpiry));
+        };
+        assert_eq!(bearer(token).unwrap(), "Bearer token");
     }
 
     #[test]
@@ -574,5 +527,118 @@ mod tests {
             client.forward(response(1)),
             Err(SessionError::ReceiverDisconnected)
         );
+    }
+
+    fn stream(
+        items: Vec<Result<SubscribePacketsResponse, Status>>,
+    ) -> impl Stream<Item = Result<SubscribePacketsResponse, Status>> + Unpin {
+        tokio_stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn consume_forwards_until_stream_ends() {
+        let (client, receiver) = client(2);
+        let result = client
+            .consume(stream(vec![Ok(response(1)), Ok(response(2))]))
+            .await;
+        assert_matches!(result, Ok(()));
+        assert_eq!(receiver.try_recv().unwrap().len(), 1);
+        assert_eq!(receiver.try_recv().unwrap().len(), 2);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    #[tokio::test]
+    async fn consume_stops_at_stream_error() {
+        let (client, receiver) = client(2);
+        let mut packets = stream(vec![
+            Ok(response(1)),
+            Err(Status::internal("stream failed")),
+            Ok(response(2)),
+        ]);
+        let result = client.consume(&mut packets).await;
+        assert_matches!(result, Err(SessionError::Status(_)));
+        assert_eq!(receiver.try_recv().unwrap().len(), 1);
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+
+        assert_eq!(packets.next().await.unwrap().unwrap(), response(2));
+    }
+
+    #[tokio::test]
+    async fn consume_stops_when_receiver_disconnects() {
+        let (client, receiver) = client(1);
+        drop(receiver);
+        let mut packets = stream(vec![Ok(response(1)), Ok(response(2))]);
+        let result = client.consume(&mut packets).await;
+        assert_matches!(result, Err(SessionError::ReceiverDisconnected));
+        assert_eq!(packets.next().await.unwrap().unwrap(), response(2));
+    }
+
+    fn backoff_client() -> BlockEngineClient {
+        let (sender, _receiver) = bounded(1);
+        BlockEngineClient::new(
+            "http://localhost".into(),
+            Keypair::new(),
+            sender,
+            BlockEngineClientConfig {
+                reconnect_backoff: BACKOFF,
+                ..BlockEngineClientConfig::default()
+            },
+        )
+    }
+
+    async fn run_sessions(outcomes: Vec<Result<(), SessionError>>) -> Vec<Duration> {
+        let client = backoff_client();
+        let start = Instant::now();
+        let mut outcomes = VecDeque::from(outcomes);
+        let mut started = Vec::new();
+        client
+            .reconnect_loop(|| {
+                started.push(start.elapsed());
+                let outcome = outcomes.pop_front().expect("loop ran past its script");
+                async move { outcome }
+            })
+            .await;
+        started
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_loop_waits_backoff_after_closed_stream_and_errors() {
+        let started = run_sessions(vec![
+            Err(SessionError::Status(Status::unavailable("down"))),
+            Ok(()),
+            Err(SessionError::ReceiverDisconnected),
+        ])
+        .await;
+        assert_eq!(started, [Duration::ZERO, BACKOFF, Duration::from_secs(10)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_loop_stops_without_backoff_when_receiver_disconnects() {
+        let start = Instant::now();
+        let started = run_sessions(vec![Err(SessionError::ReceiverDisconnected)]).await;
+        assert_eq!(started, [Duration::ZERO]);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_loop_during_backoff() {
+        let client = backoff_client();
+        let cancel = CancellationToken::new();
+        let mut sessions = 0;
+        let start = Instant::now();
+        let run = cancel
+            .clone()
+            .run_until_cancelled_owned(client.reconnect_loop(|| {
+                sessions += 1;
+                async { Err(SessionError::Status(Status::unavailable("down"))) }
+            }));
+        let cancel_mid_backoff = async {
+            time::sleep(HALF_BACKOFF).await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(run, cancel_mid_backoff);
+        assert_eq!(result, None);
+        assert_eq!(sessions, 1);
+        assert_eq!(start.elapsed(), HALF_BACKOFF);
     }
 }

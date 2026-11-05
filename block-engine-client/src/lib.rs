@@ -3,7 +3,7 @@
 use {
     agave_block_engine_proto::{
         auth::{
-            GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role, Token,
+            GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role,
             auth_service_client::AuthServiceClient,
         },
         block_engine::{
@@ -16,7 +16,6 @@ use {
     log::{debug, info, warn},
     solana_keypair::Keypair,
     solana_perf::packet::{BytesPacket, BytesPacketBatch, Meta, PacketBatch, PacketFlags},
-    solana_pubkey::Pubkey,
     solana_signer::Signer,
     std::{
         io,
@@ -150,23 +149,20 @@ impl BlockEngineClient {
         thread::Builder::new()
             .name("solBlkEngClient".into())
             .spawn(move || {
-                runtime.block_on(cancel.run_until_cancelled_owned(self.run()));
+                runtime.block_on(cancel.run_until_cancelled_owned(self.reconnect_loop(
+                    async || {
+                        let channel = connect(&self.url, &self.config).await?;
+                        let packets = self.subscribe(channel).await?;
+                        info!("Subscribed to block engine {} packets", self.url);
+                        self.consume(packets).await
+                    },
+                )));
             })
-    }
-
-    /// Runs sessions until the packet receiver is dropped, reconnecting after
-    /// the stream closes or any other failure.
-    async fn run(&self) {
-        self.reconnect_loop(|| self.run_session()).await;
     }
 
     /// Runs `session` repeatedly until it fails with `ReceiverDisconnected`,
     /// waiting `reconnect_backoff` after every other outcome.
-    async fn reconnect_loop<F, Fut>(&self, mut session: F)
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<(), SessionError>>,
-    {
+    async fn reconnect_loop(&self, mut session: impl AsyncFnMut() -> Result<(), SessionError>) {
         loop {
             match session().await {
                 Ok(()) => info!("Block engine {} closed the packet stream", self.url),
@@ -178,13 +174,6 @@ impl BlockEngineClient {
             }
             time::sleep(self.config.reconnect_backoff).await;
         }
-    }
-
-    async fn run_session(&self) -> Result<(), SessionError> {
-        let channel = connect(&self.url, &self.config).await?;
-        let packets = self.subscribe(channel).await?;
-        info!("Subscribed to block engine {} packets", self.url);
-        self.consume(packets).await
     }
 
     /// Forwards packets from `packets` until the stream ends (`Ok`) or fails.
@@ -238,10 +227,6 @@ impl BlockEngineClient {
     }
 }
 
-fn bearer(token: Token) -> Result<AsciiMetadataValue, SessionError> {
-    Ok(format!("Bearer {}", token.value).parse()?)
-}
-
 async fn connect(url: &str, config: &BlockEngineClientConfig) -> Result<Channel, SessionError> {
     let mut endpoint = Endpoint::from_shared(url.to_owned())?
         .connect_timeout(config.connect_timeout)
@@ -268,31 +253,25 @@ async fn authenticate(
         .await?
         .into_inner()
         .challenge;
-    let tokens = auth
+    let token = auth
         .generate_auth_tokens(auth_tokens_request(identity, &challenge))
         .await?
-        .into_inner();
-    bearer(
-        tokens
-            .access_token
-            .ok_or(SessionError::MissingAccessToken)?,
-    )
+        .into_inner()
+        .access_token
+        .ok_or(SessionError::MissingAccessToken)?;
+    Ok(format!("Bearer {}", token.value).parse()?)
 }
 
 /// Builds the token request answering `challenge`, signed by `identity`.
 fn auth_tokens_request(identity: &Keypair, challenge: &str) -> GenerateAuthTokensRequest {
     let pubkey = identity.pubkey();
-    let challenge = challenge_message(&pubkey, challenge);
+    let challenge = format!("{pubkey}-{challenge}");
     let signed_challenge = identity.sign_message(challenge.as_bytes());
     GenerateAuthTokensRequest {
         challenge,
         client_pubkey: pubkey.to_bytes().to_vec(),
         signed_challenge: signed_challenge.as_ref().to_vec(),
     }
-}
-
-fn challenge_message(pubkey: &Pubkey, challenge: &str) -> String {
-    format!("{pubkey}-{challenge}")
 }
 
 #[cfg(test)]
@@ -479,15 +458,6 @@ mod tests {
         assert_eq!(request.client_pubkey, pubkey.to_bytes());
         let signature = Signature::try_from(request.signed_challenge.as_slice()).unwrap();
         assert!(signature.verify(pubkey.as_ref(), request.challenge.as_bytes()));
-    }
-
-    #[test]
-    fn bearer_prefixes_token() {
-        let token = Token {
-            value: "token".into(),
-            expires_at_utc: None,
-        };
-        assert_eq!(bearer(token).unwrap(), "Bearer token");
     }
 
     #[test]

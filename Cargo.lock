@@ -78,7 +78,6 @@ dependencies = [
  "log",
  "solana-keypair",
  "solana-perf",
- "solana-pubkey 4.4.0",
  "solana-signature",
  "solana-signer",
  "thiserror 2.0.21",

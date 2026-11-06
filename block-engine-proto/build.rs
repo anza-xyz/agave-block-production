@@ -21,5 +21,6 @@ fn main() -> Result<(), std::io::Error> {
         .build_client(true)
         .build_server(true)
         .build_transport(false)
+        .bytes(".packet.Packet.data")
         .compile_protos(&protos, &[proto_base_path])
 }

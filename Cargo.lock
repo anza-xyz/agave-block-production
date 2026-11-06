@@ -70,6 +70,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-engine-client"
+version = "4.5.0-alpha.4"
+dependencies = [
+ "agave-block-engine-proto",
+ "crossbeam-channel",
+ "log",
+ "solana-keypair",
+ "solana-perf",
+ "solana-signature",
+ "solana-signer",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-stream",
+ "tokio-util 0.7.19",
+ "tonic",
+]
+
+[[package]]
 name = "agave-block-engine-proto"
 version = "4.5.0-alpha.4"
 dependencies = [
@@ -12665,6 +12683,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding 2.3.2",
  "pin-project",
+ "rustls-native-certs",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

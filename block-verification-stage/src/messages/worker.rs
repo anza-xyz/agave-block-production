@@ -2,6 +2,7 @@ use {
     agave_transaction_view::transaction_view::UnsanitizedTransactionView, bytes::Bytes,
     solana_accounts_db::bank_id::BankId, solana_clock::Slot,
     solana_entry::entry::EntryVerificationData, solana_hash::Hash,
+    solana_runtime_transaction::runtime_transaction::ReplayTransaction,
     solana_transaction_error::TransactionError,
 };
 
@@ -41,7 +42,7 @@ pub(crate) struct TransactionCheckRequest {
 #[derive(Debug)]
 pub(crate) struct TransactionCheckResponse {
     pub(crate) bank_id: BankId,
-    pub(crate) result: Result<(), TransactionCheckError>,
+    pub(crate) result: Result<ReplayTransaction, TransactionCheckError>,
 }
 
 #[derive(Debug)]

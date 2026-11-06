@@ -647,8 +647,10 @@ mod tests {
         shaq::mpmc,
         solana_entry::entry::{Entry, EntryView, entry_views_for_tests, next_entry},
         solana_keypair::Keypair,
+        solana_runtime::bank::Bank,
         solana_signer::Signer,
         solana_system_transaction as system_transaction,
+        solana_transaction::TransactionVerificationMode,
         std::num::NonZeroUsize,
         test_case::test_case,
     };
@@ -775,16 +777,19 @@ mod tests {
             self.scheduler.try_flush_completed_blocks().unwrap();
         }
 
-        /// Answers the oldest request in the queue
-        fn respond_transaction_check(&mut self, result: Result<(), TransactionCheckError>) {
+        /// Answers the oldest request in the queue as passing the check
+        fn respond_transaction_check(&mut self) {
             let request = self
                 .transaction_check_request_consumer
                 .try_read()
                 .expect("tests only respond to requests the scheduler sent");
+            let transaction = Bank::default_for_tests()
+                .verify_transaction(request.transaction, TransactionVerificationMode::HashOnly)
+                .expect("the tests only submit transactions that pass the check");
             self.scheduler
                 .handle_transaction_check_response(TransactionCheckResponse {
                     bank_id: request.bank_id,
-                    result,
+                    result: Ok(transaction),
                 });
             self.scheduler.try_flush_completed_blocks().unwrap();
         }
@@ -1012,7 +1017,7 @@ mod tests {
 
         scheduler.respond_entry_hash(true);
         scheduler.respond_entry_hash(true);
-        scheduler.respond_transaction_check(Ok(()));
+        scheduler.respond_transaction_check();
 
         scheduler.notify_all_entries_submitted(BANK_ID);
         assert_eq!(
@@ -1046,7 +1051,7 @@ mod tests {
         );
 
         scheduler.respond_entry_hash(true);
-        scheduler.respond_transaction_check(Ok(()));
+        scheduler.respond_transaction_check();
         assert_eq!(
             scheduler.try_recv_outcome(),
             Some(BlockVerificationToReplayMessage {
@@ -1115,7 +1120,7 @@ mod tests {
             "a block must not complete while transaction checks are in flight"
         );
 
-        scheduler.respond_transaction_check(Ok(()));
+        scheduler.respond_transaction_check();
         assert_eq!(
             scheduler.try_recv_outcome(),
             Some(BlockVerificationToReplayMessage {
@@ -1157,7 +1162,7 @@ mod tests {
              full"
         );
 
-        scheduler.respond_transaction_check(Ok(()));
+        scheduler.respond_transaction_check();
         assert!(
             scheduler.scheduler.workers_can_accept_request(),
             "a response must free up room for a request"

@@ -7,6 +7,7 @@ use {
     solana_accounts_db::bank_id::BankId,
     solana_clock::Slot,
     solana_runtime::bank_forks::BankForks,
+    solana_runtime_transaction::runtime_transaction::ReplayTransaction,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction::TransactionVerificationMode,
     solana_transaction_error::TransactionError,
@@ -36,7 +37,7 @@ fn check(
     bank_id: BankId,
     slot: Slot,
     transaction: UnsanitizedTransactionView<Bytes>,
-) -> Result<(), TransactionCheckError> {
+) -> Result<ReplayTransaction, TransactionCheckError> {
     let bank = bank_forks
         .read()
         .unwrap()
@@ -59,5 +60,6 @@ fn check(
             TransactionError::TooManyAccountLocks,
         ));
     }
-    Ok(())
+
+    Ok(transaction)
 }

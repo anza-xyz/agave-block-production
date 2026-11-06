@@ -63,59 +63,6 @@ impl Default for BlockEngineClientConfig {
     }
 }
 
-#[derive(Debug, Error)]
-enum SessionError {
-    #[error("transport: {0}")]
-    Transport(#[from] transport::Error),
-    #[error("rpc: {0}")]
-    Status(#[from] Status),
-    #[error("auth response has no access token")]
-    MissingAccessToken,
-    #[error("invalid access token: {0}")]
-    InvalidAccessToken(#[from] InvalidMetadataValue),
-    #[error("packet receiver disconnected")]
-    ReceiverDisconnected,
-}
-
-/// Converts a block engine packet into a [`BytesPacket`].
-/// Returns `None` for discarded packets and packets with missing or
-/// inconsistent metadata.
-fn packet_from_proto(packet: Packet) -> Option<BytesPacket> {
-    let Packet { data, meta } = packet;
-    let meta = meta?;
-
-    // Nothing really blocks outside engine to just spam packets with flag set to discarded
-    // so lets skip them early
-    if meta.flags.as_ref().is_some_and(|flags| flags.discard) {
-        return None;
-    }
-    let size = usize::try_from(meta.size)
-        .ok()
-        .filter(|&size| size != 0 && size <= data.len())?;
-    Some(BytesPacket::new(
-        data.slice(..size),
-        meta_from_proto(&meta, size),
-    ))
-}
-
-/// Maps the proto metadata onto a packet [`Meta`] of `size` bytes. An address
-/// that fails to parse is left unspecified.
-fn meta_from_proto(proto_meta: &ProtoMeta, size: usize) -> Meta {
-    let flags = proto_meta.flags.unwrap_or_default();
-    let mut meta = Meta::default();
-    meta.size = size;
-    if let Ok(addr) = proto_meta.addr.parse() {
-        meta.addr = addr;
-    }
-    meta.port = u16::try_from(proto_meta.port).unwrap_or_default();
-    meta.flags
-        .set(PacketFlags::SIMPLE_VOTE_TX, flags.simple_vote_tx);
-    meta.flags.set(PacketFlags::FORWARDED, flags.forwarded);
-    meta.flags
-        .set(PacketFlags::FROM_STAKED_NODE, flags.from_staked_node);
-    meta
-}
-
 /// Authenticates with a block engine as a validator and forwards the packets it
 /// streams. Reconnects with a fixed backoff after any failure.
 pub struct BlockEngineClient {
@@ -140,8 +87,8 @@ impl BlockEngineClient {
         }
     }
 
-    /// Runs the client on its own thread until `cancel` is cancelled or the packet
-    /// receiver is dropped.
+    /// Runs the client on its own thread until `cancel` is cancelled or an attempt
+    /// to forward a nonempty packet batch detects that the receiver was dropped.
     pub fn spawn(self, cancel: CancellationToken) -> io::Result<JoinHandle<()>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -149,14 +96,13 @@ impl BlockEngineClient {
         thread::Builder::new()
             .name("solBlkEngClient".into())
             .spawn(move || {
-                runtime.block_on(cancel.run_until_cancelled_owned(self.reconnect_loop(
-                    async || {
-                        let channel = connect(&self.url, &self.config).await?;
-                        let packets = self.subscribe(channel).await?;
-                        info!("Subscribed to block engine {} packets", self.url);
-                        self.consume(packets).await
-                    },
-                )));
+                let run = self.reconnect_loop(async || {
+                    let channel = connect(&self.url, &self.config).await?;
+                    let packets = self.subscribe(channel).await?;
+                    info!("Subscribed to block engine {} packets", self.url);
+                    self.consume(packets).await
+                });
+                runtime.block_on(cancel.run_until_cancelled_owned(run));
             })
     }
 
@@ -227,6 +173,20 @@ impl BlockEngineClient {
     }
 }
 
+#[derive(Debug, Error)]
+enum SessionError {
+    #[error("transport: {0}")]
+    Transport(#[from] transport::Error),
+    #[error("rpc: {0}")]
+    Status(#[from] Status),
+    #[error("auth response has no access token")]
+    MissingAccessToken,
+    #[error("invalid access token: {0}")]
+    InvalidAccessToken(#[from] InvalidMetadataValue),
+    #[error("packet receiver disconnected")]
+    ReceiverDisconnected,
+}
+
 async fn connect(url: &str, config: &BlockEngineClientConfig) -> Result<Channel, SessionError> {
     let mut endpoint = Endpoint::from_shared(url.to_owned())?
         .connect_timeout(config.connect_timeout)
@@ -272,6 +232,45 @@ fn auth_tokens_request(identity: &Keypair, challenge: &str) -> GenerateAuthToken
         client_pubkey: pubkey.to_bytes().to_vec(),
         signed_challenge: signed_challenge.as_ref().to_vec(),
     }
+}
+
+/// Converts a block engine packet into a [`BytesPacket`].
+/// Returns `None` for discarded packets and packets with missing or
+/// inconsistent metadata.
+fn packet_from_proto(packet: Packet) -> Option<BytesPacket> {
+    let Packet { data, meta } = packet;
+    let meta = meta?;
+
+    // Nothing really blocks outside engine to just spam packets with flag set to discarded
+    // so lets skip them early
+    if meta.flags.as_ref().is_some_and(|flags| flags.discard) {
+        return None;
+    }
+    let size = usize::try_from(meta.size)
+        .ok()
+        .filter(|&size| size != 0 && size <= data.len())?;
+    Some(BytesPacket::new(
+        data.slice(..size),
+        meta_from_proto(&meta, size),
+    ))
+}
+
+/// Maps the proto metadata onto a packet [`Meta`] of `size` bytes. An address
+/// that fails to parse is left unspecified.
+fn meta_from_proto(proto_meta: &ProtoMeta, size: usize) -> Meta {
+    let flags = proto_meta.flags.unwrap_or_default();
+    let mut meta = Meta::default();
+    meta.size = size;
+    if let Ok(addr) = proto_meta.addr.parse() {
+        meta.addr = addr;
+    }
+    meta.port = u16::try_from(proto_meta.port).unwrap_or_default();
+    meta.flags
+        .set(PacketFlags::SIMPLE_VOTE_TX, flags.simple_vote_tx);
+    meta.flags.set(PacketFlags::FORWARDED, flags.forwarded);
+    meta.flags
+        .set(PacketFlags::FROM_STAKED_NODE, flags.from_staked_node);
+    meta
 }
 
 #[cfg(test)]

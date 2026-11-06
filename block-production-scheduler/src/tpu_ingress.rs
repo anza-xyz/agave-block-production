@@ -40,7 +40,6 @@ impl Scheduler {
             return;
         };
 
-        let mut sent_packets = 0usize;
         let mut transactions = messages.iter().map(|message| {
             // SAFETY: Agave transfers exclusive ownership of an initialized transaction allocation.
             let transaction =
@@ -53,26 +52,22 @@ impl Scheduler {
         });
         // Stop dispatching when every possible response has a reserved queue slot.
         // Still drain the TPU batch below so ingress does not fall behind.
-        'batches: while accept_packets
-            && self.outstanding_check_batches < self.check_response_capacity
-            && transactions.len() != 0
-        {
-            let Some(mut batch) = CheckBatch::allocate(&self.allocator) else {
-                break;
-            };
-            for (transaction, metadata) in transactions.by_ref().take(MAX_PACKETS_PER_CHECK_BATCH) {
-                if !batch.try_push(transaction, metadata) {
-                    break 'batches;
-                }
-            }
-            let Some(count) = batch.try_send(&self.check_sender) else {
-                break;
-            };
-            self.outstanding_check_packets = self.outstanding_check_packets.saturating_add(count);
-            self.outstanding_check_batches = self.outstanding_check_batches.wrapping_add(1);
-            sent_packets = sent_packets.saturating_add(count);
-        }
+        let max_batches = if accept_packets {
+            self.check_response_capacity
+                .saturating_sub(self.outstanding_check_batches)
+        } else {
+            0
+        };
+        let (sent_batches, sent_packets) = dispatch_to_check(
+            &self.allocator,
+            &self.check_sender,
+            max_batches,
+            &mut transactions,
+        );
         transactions.for_each(drop);
+        self.outstanding_check_batches = self.outstanding_check_batches.wrapping_add(sent_batches);
+        self.outstanding_check_packets =
+            self.outstanding_check_packets.saturating_add(sent_packets);
         self.leader_slot_metrics.received_packets = self
             .leader_slot_metrics
             .received_packets
@@ -82,6 +77,38 @@ impl Scheduler {
             .dropped_transactions
             .saturating_add(messages.len().saturating_sub(sent_packets));
     }
+}
+
+/// Returns the number of batches and packets sent.
+fn dispatch_to_check<'a>(
+    allocator: &'a Allocator,
+    queue: &shaq::mpmc::Producer<PackToCheckWorkerMessage>,
+    max_batches: usize,
+    transactions: &mut impl Iterator<Item = (OwnedTransactionPtr<'a>, TpuTransactionMeta)>,
+) -> (usize, usize) {
+    let mut sent_batches = 0usize;
+    let mut sent_packets = 0usize;
+    'batches: while sent_batches < max_batches {
+        let Some(first) = transactions.next() else {
+            break;
+        };
+        let Some(mut batch) = CheckBatch::allocate(allocator) else {
+            break;
+        };
+        let members = core::iter::once(first)
+            .chain(transactions.by_ref().take(MAX_PACKETS_PER_CHECK_BATCH - 1));
+        for (transaction, metadata) in members {
+            if !batch.try_push(transaction, metadata) {
+                break 'batches;
+            }
+        }
+        let Some(count) = batch.try_send(queue) else {
+            break;
+        };
+        sent_batches = sent_batches.wrapping_add(1);
+        sent_packets = sent_packets.saturating_add(count);
+    }
+    (sent_batches, sent_packets)
 }
 
 fn should_accept_packets(state: &SchedulerState) -> bool {

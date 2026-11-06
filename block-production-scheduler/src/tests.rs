@@ -1,7 +1,7 @@
 use {
     super::*,
     crate::{
-        check_response::{Payload, TransactionPayload},
+        check_response::{BundlePayload, Payload, TransactionPayload},
         resolved_transaction::ResolvedTransaction,
         tpu_ingress::{
             MAX_PACKETS_PER_CHECK_BATCH, MAX_TPU_PACKETS_PER_ITERATION, TpuTransactionMeta,
@@ -10,10 +10,12 @@ use {
     agave_scheduler_bindings::SharableTransactionRegion,
     agave_scheduler_handshake::{AgaveSession, ClientLogon, server::Server, setup_local_session},
     agave_scheduling_utils::{pubkeys_ptr::OwnedPubkeysPtr, transaction_ptr::OwnedTransactionPtr},
+    crossbeam_channel::TryRecvError,
+    solana_keypair::write_keypair_file,
     solana_message::{Message, MessageHeader, VersionedMessage},
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
-    std::{os::unix::net::UnixListener, path::Path, sync::Arc, thread},
+    std::{assert_matches, os::unix::net::UnixListener, path::Path, sync::Arc, thread},
 };
 
 mod scheduling_flows;
@@ -43,6 +45,7 @@ fn config(path: &Path) -> Config {
             max_cost_units_per_batch: 1_000_000,
             target_entry_bytes_per_batch: 4_622,
         },
+        block_engine: None,
     }
 }
 
@@ -93,6 +96,7 @@ pub(super) fn setup_with_capacities(
         1_000_000,
         1_000_000,
         4_622,
+        crossbeam_channel::never(),
     )
     .unwrap();
     scheduler.state = SchedulerState::LeaderReady {
@@ -104,21 +108,18 @@ pub(super) fn setup_with_capacities(
     (scheduler, agave)
 }
 
-pub(super) fn insert(
-    scheduler: &mut Scheduler,
-    priority: u64,
-    cost: u64,
-    accounts: &[u8],
-) -> usize {
+fn resolve(scheduler: &Scheduler, writable: &[u8], readonly: &[u8]) -> ResolvedTransaction {
     let bytes = wincode::serialize(&VersionedTransaction {
         signatures: vec![Signature::default()],
         message: VersionedMessage::Legacy(Message {
             header: MessageHeader {
                 num_required_signatures: 1,
+                num_readonly_unsigned_accounts: readonly.len() as u8,
                 ..Default::default()
             },
-            account_keys: accounts
+            account_keys: writable
                 .iter()
+                .chain(readonly)
                 .map(|&key| Pubkey::from([key; 32]))
                 .collect(),
             ..Default::default()
@@ -139,7 +140,7 @@ pub(super) fn insert(
     // SAFETY: no pubkey allocation is needed for a legacy transaction.
     let pubkeys = unsafe { OwnedPubkeysPtr::from_region(None, allocator) };
     // SAFETY: the transaction belongs to this allocator.
-    let transaction = unsafe {
+    unsafe {
         ResolvedTransaction::try_new(
             transaction,
             pubkeys,
@@ -147,19 +148,16 @@ pub(super) fn insert(
             &scheduler.reserved_account_keys,
         )
     }
-    .unwrap();
+    .unwrap()
+}
+
+fn insert_payload(scheduler: &mut Scheduler, priority: u64, cost: u64, payload: Payload) -> usize {
     scheduler
         .transactions
         .insert(
             priority,
             TransactionState {
-                payload: Payload::Transaction(TransactionPayload {
-                    transaction,
-                    metadata: TpuTransactionMeta {
-                        flags: 0,
-                        src_addr: [0; 16],
-                    },
-                }),
+                payload,
                 cost,
                 allocated_accounts_data_size: 1,
                 execution_worker: None,
@@ -168,6 +166,41 @@ pub(super) fn insert(
         .ok()
         .unwrap()
         .0
+}
+
+pub(super) fn insert(
+    scheduler: &mut Scheduler,
+    priority: u64,
+    cost: u64,
+    accounts: &[u8],
+) -> usize {
+    let transaction = resolve(scheduler, accounts, &[]);
+    let payload = Payload::Transaction(TransactionPayload {
+        transaction,
+        metadata: TpuTransactionMeta {
+            flags: 0,
+            src_addr: [0; 16],
+        },
+    });
+    insert_payload(scheduler, priority, cost, payload)
+}
+
+pub(super) fn insert_bundle(
+    scheduler: &mut Scheduler,
+    priority: u64,
+    cost: u64,
+    members: &[(&[u8], &[u8])],
+) -> usize {
+    let members = members
+        .iter()
+        .map(|(writable, readonly)| resolve(scheduler, writable, readonly))
+        .collect();
+    insert_payload(
+        scheduler,
+        priority,
+        cost,
+        Payload::Bundle(BundlePayload { members }),
+    )
 }
 
 #[test]
@@ -184,6 +217,7 @@ fn config_uses_shared_defaults_and_overrides() {
         scheduler.max_cost_units_per_worker
     );
     assert_eq!(config.scheduler.execution_margin, Duration::from_millis(10));
+    assert!(config.block_engine.is_none());
 
     let config = Config::from_toml(
         r"
@@ -222,6 +256,117 @@ fn config_requires_path_and_rejects_unknown_fields() {
     assert!(
         Config::from_toml("ipc_path = '/ledger/socket'\n[scheduler]\nfilter_keys = ['invalid']")
             .is_err()
+    );
+}
+
+#[test]
+fn config_enables_block_engine_with_section() {
+    let config = Config::from_toml(
+        r"
+ipc_path = '/ledger/socket'
+[block_engine]
+url = 'https://block-engine.example'
+keypair_path = '/keys/identity.json'
+",
+    )
+    .unwrap();
+    let block_engine = config.block_engine.unwrap();
+    assert_eq!(block_engine.url, "https://block-engine.example");
+    assert_eq!(block_engine.keypair_path, Path::new("/keys/identity.json"));
+    assert_eq!(block_engine.block_engine_to_pack_capacity, 1024);
+
+    let config = Config::from_toml(
+        r"
+ipc_path = '/ledger/socket'
+[block_engine]
+url = 'https://block-engine.example'
+keypair_path = '/keys/identity.json'
+block_engine_to_pack_capacity = 16
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.block_engine.unwrap().block_engine_to_pack_capacity,
+        16
+    );
+}
+
+#[test]
+fn config_rejects_incomplete_block_engine_section() {
+    for block_engine in [
+        "keypair_path = '/keys/identity.json'",
+        "url = 'https://block-engine.example'",
+        "url = 'https://block-engine.example'\nkeypair_path = '/keys/identity.json'\nunknown = 1",
+    ] {
+        let source = format!("ipc_path = '/ledger/socket'\n[block_engine]\n{block_engine}");
+        assert!(Config::from_toml(&source).is_err(), "{block_engine}");
+    }
+}
+
+fn block_engine_config(keypair_path: PathBuf) -> BlockEngineConfig {
+    BlockEngineConfig {
+        url: "http://127.0.0.1:1".to_string(), // bad url
+        keypair_path,
+        block_engine_to_pack_capacity: 16,
+    }
+}
+
+#[test]
+fn load_block_engine_without_config() {
+    assert_matches!(load_block_engine(None), Ok(None));
+}
+
+#[test]
+fn load_block_engine_reads_keypair() {
+    let directory = tempfile::tempdir().unwrap();
+    let keypair_path = directory.path().join("identity.json");
+    let keypair = Keypair::new();
+    write_keypair_file(&keypair, &keypair_path).unwrap();
+
+    let (config, identity) = load_block_engine(Some(block_engine_config(keypair_path.clone())))
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.keypair_path, keypair_path);
+    assert_eq!(identity.to_bytes(), keypair.to_bytes());
+}
+
+#[test]
+fn load_block_engine_rejects_missing_keypair() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+
+    assert_matches!(
+        load_block_engine(Some(block_engine_config(missing.clone()))),
+        Err(SchedulerError::BlockEngineKeypair { path, .. }) if path == missing
+    );
+}
+
+#[test]
+fn spawn_block_engine_without_config() {
+    let (receiver, client) = spawn_block_engine(None).unwrap();
+    assert_matches!(client, BlockEngineHandle::Off);
+    assert_matches!(receiver.try_recv(), Err(TryRecvError::Empty));
+    client.stop();
+}
+
+#[test]
+fn spawn_block_engine_stops_running_client() {
+    let config = block_engine_config(PathBuf::from("/unused"));
+    let (_receiver, client) = spawn_block_engine(Some((config, Keypair::new()))).unwrap();
+    assert_matches!(client, BlockEngineHandle::Running { .. });
+    client.stop();
+}
+
+#[test]
+fn run_fails_on_missing_block_engine_keypair() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let mut config = config(&directory.path().join("scheduler.ipc"));
+    config.block_engine = Some(block_engine_config(missing.clone()));
+
+    assert_matches!(
+        run(config, &AtomicBool::new(false)),
+        Err(SchedulerError::BlockEngineKeypair { path, .. }) if path == missing
     );
 }
 

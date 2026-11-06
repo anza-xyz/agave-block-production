@@ -20,3 +20,10 @@ execution_margin_ms = 10
 max_cost_units_per_worker = 3750000
 max_cost_units_per_batch = 1000000
 target_entry_bytes_per_batch = 4622
+
+# No block engine by default. Add this section to receive
+# packets and bundles:
+# [block_engine]
+# url = "https://..."
+# keypair_path = "/path/to/identity.json"
+# block_engine_to_pack_capacity = 1024

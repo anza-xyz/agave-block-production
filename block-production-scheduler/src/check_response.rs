@@ -5,7 +5,8 @@ use {
         tpu_ingress::{RawCheckBatch, TpuTransactionMeta},
     },
     agave_scheduler_bindings::{
-        CheckWorkerToPackMessage, processed_codes, tpu_message_flags,
+        CheckWorkerToPackMessage, SharableTransactionRegion, execution_message_flags,
+        processed_codes, tpu_message_flags,
         worker_message_types::{
             CheckResponse, age_nonce_check_flags, fee_payer_balance_flags,
             parsing_and_sanitization_flags, resolve_flags, scheduling_details_flags,
@@ -23,6 +24,8 @@ use {
 const MAX_CHECK_RESPONSE_PACKETS_PER_ITERATION: usize = 512;
 const BURN_PERCENT: u64 = 50;
 const PRIORITY_MULTIPLIER: u64 = 1_000_000;
+pub(super) const BUNDLE_EXECUTION_FLAGS: u16 =
+    execution_message_flags::DROP_ON_FAILURE | execution_message_flags::ALL_OR_NOTHING;
 
 #[cfg_attr(
     not(test),
@@ -41,7 +44,7 @@ pub(super) struct TransactionState {
 )]
 pub(super) enum Payload {
     Transaction(TransactionPayload),
-    #[expect(dead_code, reason = "bundles are not handled yet")]
+    #[cfg_attr(not(test), expect(dead_code, reason = "bundles are not handled yet"))]
     Bundle(BundlePayload),
 }
 
@@ -76,6 +79,41 @@ impl TransactionState {
         self.members()
             .iter()
             .flat_map(|member| member.account_keys_with_writable())
+    }
+
+    pub(super) fn is_bundle(&self) -> bool {
+        matches!(self.payload, Payload::Bundle(_))
+    }
+
+    pub(super) fn num_transactions(&self) -> usize {
+        self.members().len()
+    }
+
+    /// Serialized size of every member.
+    pub(super) fn serialized_size(&self) -> u64 {
+        self.members()
+            .iter()
+            .map(|member| member.view.data().len() as u64)
+            .sum()
+    }
+
+    pub(super) fn execution_flags(&self) -> u16 {
+        match self.payload {
+            Payload::Transaction(_) => 0,
+            Payload::Bundle(_) => BUNDLE_EXECUTION_FLAGS,
+        }
+    }
+
+    /// # Safety
+    /// Every transaction must belong to `allocator` and remain retained while the regions are used.
+    pub(super) unsafe fn to_regions(
+        &self,
+        allocator: &Allocator,
+    ) -> impl Iterator<Item = SharableTransactionRegion> {
+        self.members()
+            .iter()
+            // SAFETY: the caller guarantees the allocator and retention.
+            .map(move |member| unsafe { member.to_region(allocator) })
     }
 
     /// # Safety

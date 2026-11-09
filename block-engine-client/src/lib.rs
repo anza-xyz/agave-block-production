@@ -27,11 +27,19 @@ use {
     tokio_stream::{Stream, StreamExt},
     tokio_util::sync::CancellationToken,
     tonic::{
-        Request, Status, Streaming,
+        Request, Status,
         metadata::{AsciiMetadataValue, errors::InvalidMetadataValue},
         transport::{self, Channel, ClientTlsConfig, Endpoint},
     },
 };
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE_RETRIES: u32 = 3;
+const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+const THREAD_NAME: &str = "solBlkEngClient";
 
 /// Timeouts and intervals used by [`BlockEngineClient`].
 #[derive(Clone, Debug)]
@@ -53,12 +61,12 @@ pub struct BlockEngineClientConfig {
 impl Default for BlockEngineClientConfig {
     fn default() -> Self {
         Self {
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(5),
-            tcp_keepalive: Duration::from_secs(60),
-            tcp_keepalive_interval: Duration::from_secs(10),
-            tcp_keepalive_retries: 3,
-            reconnect_backoff: Duration::from_secs(5),
+            connect_timeout: CONNECT_TIMEOUT,
+            request_timeout: REQUEST_TIMEOUT,
+            tcp_keepalive: TCP_KEEPALIVE,
+            tcp_keepalive_interval: TCP_KEEPALIVE_INTERVAL,
+            tcp_keepalive_retries: TCP_KEEPALIVE_RETRIES,
+            reconnect_backoff: RECONNECT_BACKOFF,
         }
     }
 }
@@ -94,11 +102,19 @@ impl BlockEngineClient {
             .enable_all()
             .build()?;
         thread::Builder::new()
-            .name("solBlkEngClient".into())
+            .name(THREAD_NAME.into())
             .spawn(move || {
                 let run = self.reconnect_loop(async || {
                     let channel = connect(&self.url, &self.config).await?;
-                    let packets = self.subscribe(channel).await?;
+                    let access_token =
+                        authenticate(&mut AuthServiceClient::new(channel.clone()), &self.identity)
+                            .await?;
+                    let mut request = Request::new(SubscribePacketsRequest {});
+                    request.metadata_mut().insert("authorization", access_token);
+                    let packets = BlockEngineValidatorClient::new(channel)
+                        .subscribe_packets(request)
+                        .await?
+                        .into_inner();
                     info!("Subscribed to block engine {} packets", self.url);
                     self.consume(packets).await
                 });
@@ -131,20 +147,6 @@ impl BlockEngineClient {
             self.forward(response?)?;
         }
         Ok(())
-    }
-
-    async fn subscribe(
-        &self,
-        channel: Channel,
-    ) -> Result<Streaming<SubscribePacketsResponse>, SessionError> {
-        let access_token =
-            authenticate(&mut AuthServiceClient::new(channel.clone()), &self.identity).await?;
-        let mut request = Request::new(SubscribePacketsRequest {});
-        request.metadata_mut().insert("authorization", access_token);
-        Ok(BlockEngineValidatorClient::new(channel)
-            .subscribe_packets(request)
-            .await?
-            .into_inner())
     }
 
     fn forward(&self, response: SubscribePacketsResponse) -> Result<(), SessionError> {

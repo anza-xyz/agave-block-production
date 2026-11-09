@@ -39,7 +39,7 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE_RETRIES: u32 = 3;
 const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
-const THREAD_NAME: &str = "solBlkEngClient";
+const SOL_BLOCK_ENGINE_CLIENT_THREAD: &str = "solBlkEngClient";
 
 /// Timeouts and intervals used by [`BlockEngineClient`].
 #[derive(Clone, Debug)]
@@ -102,7 +102,7 @@ impl BlockEngineClient {
             .enable_all()
             .build()?;
         thread::Builder::new()
-            .name(THREAD_NAME.into())
+            .name(SOL_BLOCK_ENGINE_CLIENT_THREAD.into())
             .spawn(move || {
                 let run = self.reconnect_loop(async || {
                     let channel = connect(&self.url, &self.config).await?;

@@ -44,23 +44,19 @@ impl Scheduler {
             .iter()
             .next()
             .expect("published batches are never empty");
-        if self.transactions.get(first).unwrap().is_bundle() {
+        if self
+            .transactions
+            .get(first)
+            .expect("in-flight batch members stay in the container until completed")
+            .is_bundle()
+        {
             // SAFETY: the bundle stays retained by its id; the returned container is exclusively ours.
             unsafe { batch.free() };
-            let (estimated_cost, actual_cost, dropped) =
-                self.complete_bundle(worker, &message, first, num_transactions);
-            self.finish_batch(
-                worker,
-                num_transactions,
-                estimated_cost,
-                actual_cost,
-                dropped,
-            );
+            let completed = self.complete_bundle(worker, &message, first, num_transactions);
+            self.finish_batch(worker, num_transactions, completed);
             return;
         }
-        let mut estimated_cost = 0u64;
-        let mut actual_cost = 0u64;
-        let mut dropped = 0usize;
+        let mut completed = CompletedBatch::default();
         if message.processed_code == processed_codes::PROCESSED {
             assert_eq!(
                 usize::from(message.responses.num_transaction_responses),
@@ -77,23 +73,27 @@ impl Scheduler {
             for ((_, id), response) in batch.iter().zip(responses.iter()) {
                 let action = ExecutionResponseAction::from_response(response);
                 if response.not_included_reason == not_included_reasons::NONE {
-                    actual_cost = actual_cost.saturating_add(response.cost_units);
+                    completed.actual_cost =
+                        completed.actual_cost.saturating_add(response.cost_units);
                     self.leader_slot_metrics.completed_transactions = self
                         .leader_slot_metrics
                         .completed_transactions
                         .saturating_add(1);
                 } else if matches!(action, ExecutionResponseAction::Release) {
-                    dropped = dropped.saturating_add(1);
+                    completed.dropped = completed.dropped.saturating_add(1);
                 }
-                estimated_cost = estimated_cost.saturating_add(complete_transaction(
-                    id,
-                    worker,
-                    action,
-                    &mut self.transactions,
-                    &mut self.account_locks,
-                    &mut self.deferred_execution,
-                    &self.allocator,
-                ));
+                completed.estimated_cost =
+                    completed
+                        .estimated_cost
+                        .saturating_add(complete_transaction(
+                            id,
+                            worker,
+                            action,
+                            &mut self.transactions,
+                            &mut self.account_locks,
+                            &mut self.deferred_execution,
+                            &self.allocator,
+                        ));
             }
             // SAFETY: all responses have been consumed and the allocation is exclusively ours.
             unsafe { responses.free(&self.allocator) };
@@ -101,40 +101,36 @@ impl Scheduler {
             // Unprocessed messages have an undefined response region.
             let action = ExecutionResponseAction::from_processed_code(message.processed_code);
             if matches!(action, ExecutionResponseAction::Release) {
-                dropped = dropped.saturating_add(batch.len());
+                completed.dropped = completed.dropped.saturating_add(batch.len());
             }
             for (_, id) in batch.iter() {
-                estimated_cost = estimated_cost.saturating_add(complete_transaction(
-                    id,
-                    worker,
-                    action,
-                    &mut self.transactions,
-                    &mut self.account_locks,
-                    &mut self.deferred_execution,
-                    &self.allocator,
-                ));
+                completed.estimated_cost =
+                    completed
+                        .estimated_cost
+                        .saturating_add(complete_transaction(
+                            id,
+                            worker,
+                            action,
+                            &mut self.transactions,
+                            &mut self.account_locks,
+                            &mut self.deferred_execution,
+                            &self.allocator,
+                        ));
             }
         }
         // SAFETY: transactions have been retained or freed; the returned container is exclusively ours.
         unsafe { batch.free() };
-        self.finish_batch(
-            worker,
-            num_transactions,
-            estimated_cost,
-            actual_cost,
-            dropped,
-        );
+        self.finish_batch(worker, num_transactions, completed);
     }
 
-    /// Completes a bundle once from its folded responses, returning estimated cost, actual cost
-    /// and dropped transactions.
+    /// Completes a bundle once from its folded responses.
     fn complete_bundle(
         &mut self,
         worker: ThreadId,
         message: &ExecutionWorkerToPackMessage,
         id: usize,
         num_transactions: usize,
-    ) -> (u64, u64, usize) {
+    ) -> CompletedBatch {
         let mut actual_cost = 0u64;
         let mut committed = false;
         let action = if message.processed_code == processed_codes::PROCESSED {
@@ -198,28 +194,37 @@ impl Scheduler {
             &mut self.deferred_execution,
             &self.allocator,
         );
-        (estimated_cost, actual_cost, dropped)
+        CompletedBatch {
+            estimated_cost,
+            actual_cost,
+            dropped,
+        }
     }
 
     fn finish_batch(
         &mut self,
         worker: ThreadId,
         num_transactions: usize,
-        estimated_cost: u64,
-        actual_cost: u64,
-        dropped: usize,
+        completed: CompletedBatch,
     ) {
         self.in_flight
-            .complete_batch(worker, num_transactions, estimated_cost);
+            .complete_batch(worker, num_transactions, completed.estimated_cost);
         self.leader_slot_metrics.dropped_transactions = self
             .leader_slot_metrics
             .dropped_transactions
-            .saturating_add(dropped);
+            .saturating_add(completed.dropped);
         self.scheduled_cost = self
             .scheduled_cost
-            .saturating_sub(estimated_cost)
-            .saturating_add(actual_cost);
+            .saturating_sub(completed.estimated_cost)
+            .saturating_add(completed.actual_cost);
     }
+}
+
+#[derive(Default)]
+struct CompletedBatch {
+    estimated_cost: u64,
+    actual_cost: u64,
+    dropped: usize,
 }
 
 fn complete_transaction(
@@ -290,7 +295,13 @@ mod tests {
         },
         agave_scheduler_bindings::{
             ExecutionResponseRegion, PackToExecutionWorkerMessage, SharableTransactionBatchRegion,
-            worker_message_types::execution_statuses,
+            worker_message_types::{
+                execution_statuses,
+                not_included_reasons::{
+                    ACCOUNT_IN_USE, ALL_OR_NOTHING_BATCH_FAILURE, BLOCKHASH_NOT_FOUND,
+                    WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT,
+                },
+            },
         },
         agave_scheduler_handshake::AgaveSession,
         agave_scheduling_utils::{
@@ -299,6 +310,7 @@ mod tests {
         core::time::Duration,
         solana_pubkey::Pubkey,
         std::time::Instant,
+        test_case::test_case,
     };
 
     fn batch(
@@ -542,71 +554,49 @@ mod tests {
         assert_unlocked(&mut scheduler, &[1, 2, 5, 6, 7, 8]);
     }
 
-    #[test]
-    fn handles_uncommitted_bundle_by_failing_member_reason() {
-        enum Outcome {
-            Requeued,
-            Deferred,
-            Dropped,
-        }
-        use not_included_reasons::{
-            ACCOUNT_IN_USE, ALL_OR_NOTHING_BATCH_FAILURE, BLOCKHASH_NOT_FOUND,
-            WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT,
-        };
-        for (reasons, outcome) in [
-            (
-                [ALL_OR_NOTHING_BATCH_FAILURE, ACCOUNT_IN_USE],
-                Outcome::Requeued,
-            ),
-            (
-                [
-                    ALL_OR_NOTHING_BATCH_FAILURE,
-                    WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT,
-                ],
-                Outcome::Deferred,
-            ),
-            (
-                [BLOCKHASH_NOT_FOUND, ALL_OR_NOTHING_BATCH_FAILURE],
-                Outcome::Dropped,
-            ),
-            (
-                [ALL_OR_NOTHING_BATCH_FAILURE, ALL_OR_NOTHING_BATCH_FAILURE],
-                Outcome::Dropped,
-            ),
-        ] {
-            let (mut scheduler, mut agave) = setup_with_workers(2, 2);
-            let bundle = insert_bundle(&mut scheduler, 1, 100, &[(&[1], &[]), (&[2], &[])]);
-            let batch = batch(&mut scheduler, 0, &[bundle]);
-            respond(
-                &scheduler,
-                &mut agave,
-                0,
-                batch,
-                &reasons.map(|reason| response(reason, 0)),
-            );
-            scheduler.handle_execution_worker_responses();
+    enum Outcome {
+        Requeued,
+        Deferred,
+        Dropped,
+    }
 
-            assert!(scheduler.in_flight.is_empty());
-            assert_eq!(scheduler.scheduled_cost, 0);
-            assert_eq!(scheduler.leader_slot_metrics.completed_transactions, 0);
-            assert_unlocked(&mut scheduler, &[1, 2]);
-            match outcome {
-                Outcome::Requeued => {
-                    assert_eq!(
-                        scheduler.transactions.get(bundle).unwrap().execution_worker,
-                        None
-                    );
-                    assert_eq!(scheduler.transactions.pop_highest(), Some(bundle));
-                    assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 0);
-                }
-                Outcome::Deferred => {
-                    assert_eq!(scheduler.deferred_execution, [bundle]);
-                    assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 0);
-                }
-                Outcome::Dropped => {
-                    assert!(scheduler.transactions.get(bundle).is_none());
-                    assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 2);
-                }
+    #[test_case([ALL_OR_NOTHING_BATCH_FAILURE, ACCOUNT_IN_USE], Outcome::Requeued; "requeues_on_account_in_use")]
+    #[test_case([ALL_OR_NOTHING_BATCH_FAILURE, WOULD_EXCEED_MAX_ACCOUNT_COST_LIMIT], Outcome::Deferred; "defers_on_account_cost_limit")]
+    #[test_case([BLOCKHASH_NOT_FOUND, ALL_OR_NOTHING_BATCH_FAILURE], Outcome::Dropped; "drops_on_blockhash_not_found")]
+    #[test_case([ALL_OR_NOTHING_BATCH_FAILURE, ALL_OR_NOTHING_BATCH_FAILURE], Outcome::Dropped; "drops_without_failing_reason")]
+    fn handles_uncommitted_bundle_by_failing_member_reason(reasons: [u8; 2], outcome: Outcome) {
+        let (mut scheduler, mut agave) = setup_with_workers(2, 2);
+        let bundle = insert_bundle(&mut scheduler, 1, 100, &[(&[1], &[]), (&[2], &[])]);
+        let batch = batch(&mut scheduler, 0, &[bundle]);
+        respond(
+            &scheduler,
+            &mut agave,
+            0,
+            batch,
+            &reasons.map(|reason| response(reason, 0)),
+        );
+        scheduler.handle_execution_worker_responses();
+
+        assert!(scheduler.in_flight.is_empty());
+        assert_eq!(scheduler.scheduled_cost, 0);
+        assert_eq!(scheduler.leader_slot_metrics.completed_transactions, 0);
+        assert_unlocked(&mut scheduler, &[1, 2]);
+        match outcome {
+            Outcome::Requeued => {
+                assert_eq!(
+                    scheduler.transactions.get(bundle).unwrap().execution_worker,
+                    None
+                );
+                assert_eq!(scheduler.transactions.pop_highest(), Some(bundle));
+                assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 0);
+            }
+            Outcome::Deferred => {
+                assert_eq!(scheduler.deferred_execution, [bundle]);
+                assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 0);
+            }
+            Outcome::Dropped => {
+                assert!(scheduler.transactions.get(bundle).is_none());
+                assert_eq!(scheduler.leader_slot_metrics.dropped_transactions, 2);
             }
         }
     }

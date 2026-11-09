@@ -33,13 +33,13 @@ use {
     },
 };
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const TCP_KEEPALIVE_RETRIES: u32 = 3;
-const RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
-const SOL_BLOCK_ENGINE_CLIENT_THREAD: &str = "solBlkEngClient";
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+const DEFAULT_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const DEFAULT_TCP_KEEPALIVE_RETRIES: u32 = 3;
+const DEFAULT_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+const SOL_BLOCK_ENGINE_CLIENT_THREAD_NAME: &str = "solBlkEngClient";
 
 /// Timeouts and intervals used by [`BlockEngineClient`].
 #[derive(Clone, Debug)]
@@ -61,12 +61,12 @@ pub struct BlockEngineClientConfig {
 impl Default for BlockEngineClientConfig {
     fn default() -> Self {
         Self {
-            connect_timeout: CONNECT_TIMEOUT,
-            request_timeout: REQUEST_TIMEOUT,
-            tcp_keepalive: TCP_KEEPALIVE,
-            tcp_keepalive_interval: TCP_KEEPALIVE_INTERVAL,
-            tcp_keepalive_retries: TCP_KEEPALIVE_RETRIES,
-            reconnect_backoff: RECONNECT_BACKOFF,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            tcp_keepalive: DEFAULT_TCP_KEEPALIVE,
+            tcp_keepalive_interval: DEFAULT_TCP_KEEPALIVE_INTERVAL,
+            tcp_keepalive_retries: DEFAULT_TCP_KEEPALIVE_RETRIES,
+            reconnect_backoff: DEFAULT_RECONNECT_BACKOFF,
         }
     }
 }
@@ -102,7 +102,7 @@ impl BlockEngineClient {
             .enable_all()
             .build()?;
         thread::Builder::new()
-            .name(SOL_BLOCK_ENGINE_CLIENT_THREAD.into())
+            .name(SOL_BLOCK_ENGINE_CLIENT_THREAD_NAME.into())
             .spawn(move || {
                 let run = self.reconnect_loop(async || {
                     let channel = connect(&self.url, &self.config).await?;

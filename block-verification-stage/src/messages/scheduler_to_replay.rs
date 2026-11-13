@@ -15,7 +15,7 @@ pub enum BlockVerificationOutcome {
     Verified,
     VerificationFailed(VerificationFailureReason),
     Aborted,
-    /// The bank of the block was not in bank forks when its transactions were checked.
+    /// The bank of the block was not in bank forks when its transactions were being processed.
     BankNotFound,
 }
 
@@ -24,4 +24,5 @@ pub enum VerificationFailureReason {
     InvalidEntryHash,
     InvalidSignature,
     InvalidTransaction(TransactionError),
+    TransactionExecutionFailed(TransactionError),
 }

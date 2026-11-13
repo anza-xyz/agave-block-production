@@ -23,12 +23,14 @@ pub(crate) fn check_transaction(
     TransactionCheckRequest {
         bank_id,
         slot,
+        transaction_index,
         transaction,
     }: TransactionCheckRequest,
 ) -> TransactionCheckResponse {
     TransactionCheckResponse {
         bank_id,
-        result: check(bank_forks, bank_id, slot, transaction),
+        transaction_index,
+        result: check(bank_forks, bank_id, slot, transaction).map(Box::new),
     }
 }
 

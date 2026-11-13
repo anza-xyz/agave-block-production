@@ -1,6 +1,7 @@
 pub(crate) mod entry_hash_verification;
 pub(crate) mod signature_verification;
 pub(crate) mod transaction_check;
+pub(crate) mod transaction_execution;
 
 use {
     crate::join_thread,

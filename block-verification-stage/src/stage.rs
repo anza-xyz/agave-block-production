@@ -30,12 +30,13 @@
 //!
 //!   Outcome, sent once per block on BlockVerificationStage::scheduler_message_receiver()
 //!   as BlockVerificationToReplayMessage { slot, bank_id, verification_status }:
-//!     Verified            ──► all entries submitted and verified
+//!     Verified            ──► all entries submitted and verified, and their transactions
+//!                             executed
 //!     VerificationFailed  ──► an entry failed verification, possibly before all entries were
 //!                             submitted. Entries submitted afterwards are ignored
 //!     Aborted             ──► aborted before verification finished
 //!     BankNotFound        ──► the bank of the block was not in bank forks when its transactions
-//!                             were checked
+//!                             were being processed
 //!   An abort arriving after the outcome was sent is ignored.
 //!
 //!   Every transition fails with an error if the scheduler has shut down.

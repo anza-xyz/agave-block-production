@@ -10,6 +10,8 @@ const DEFAULT_MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT: NonZeroUsize =
     NonZeroUsize::new(4096).unwrap();
 const DEFAULT_NUM_TRANSACTION_CHECK_WORKERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 const DEFAULT_MAX_TRANSACTION_CHECKS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(4096).unwrap();
+const DEFAULT_NUM_TRANSACTION_EXECUTION_WORKERS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+const DEFAULT_MAX_TRANSACTION_EXECUTIONS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
@@ -21,6 +23,8 @@ pub struct SchedulerConfig {
     pub max_signature_verifications_in_flight: NonZeroUsize,
     pub num_transaction_check_workers: NonZeroUsize,
     pub max_transaction_checks_in_flight: NonZeroUsize,
+    pub num_transaction_execution_workers: NonZeroUsize,
+    pub max_transaction_executions_in_flight: NonZeroUsize,
 }
 
 impl Default for SchedulerConfig {
@@ -36,6 +40,8 @@ impl Default for SchedulerConfig {
             max_signature_verifications_in_flight: DEFAULT_MAX_SIGNATURE_VERIFICATIONS_IN_FLIGHT,
             num_transaction_check_workers: DEFAULT_NUM_TRANSACTION_CHECK_WORKERS,
             max_transaction_checks_in_flight: DEFAULT_MAX_TRANSACTION_CHECKS_IN_FLIGHT,
+            num_transaction_execution_workers: DEFAULT_NUM_TRANSACTION_EXECUTION_WORKERS,
+            max_transaction_executions_in_flight: DEFAULT_MAX_TRANSACTION_EXECUTIONS_IN_FLIGHT,
         }
     }
 }

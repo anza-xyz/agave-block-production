@@ -1,7 +1,8 @@
 use {
     crate::helpers::{
-        BOGUS_HASH, PARENT_BANK_LAST_ENTRY_HASH, RECV_TIMEOUT, SLOT, TEST_SCHEDULER_CONFIG,
-        TestBank, recv_outcome, sign, submit_entries, transfer,
+        BOGUS_HASH, NUM_HASHES_PER_ENTRY, PARENT_BANK_LAST_ENTRY_HASH, PAYER_LAMPORTS,
+        RECV_TIMEOUT, SLOT, TEST_SCHEDULER_CONFIG, TestBank, recv_outcome, sign, submit_entries,
+        transfer,
     },
     block_verification_stage::{
         SchedulerConfig,
@@ -22,6 +23,7 @@ use {
         state::{AddressLookupTable, LookupTableMeta},
     },
     solana_clock::Slot,
+    solana_cost_model::cost_tracker::CostTrackerLimits,
     solana_entry::entry::{
         entry_views_for_tests, next_entry, next_entry_mut, next_versioned_entry,
     },
@@ -30,7 +32,8 @@ use {
     solana_pubkey::Pubkey,
     solana_runtime_transaction::transaction_limits::MAX_V1_ACCOUNTS,
     solana_signer::Signer,
-    solana_system_interface::instruction as system_instruction,
+    solana_system_interface::{instruction as system_instruction, program as system_program},
+    solana_system_transaction as system_transaction,
     solana_transaction::versioned::VersionedTransaction,
     solana_transaction_error::TransactionError,
     std::{
@@ -353,6 +356,83 @@ fn block_with_valid_entries_passes_verification(num_signatures: u8) {
     assert_matches!(stage.join(), Ok(()));
 }
 
+// The first transfer is paid by the funded payer and each later one by the recipient of the one
+// before it, so the lamports only reach the last recipient when the transfers execute in order.
+#[test]
+fn transactions_execute_in_block_order_and_are_committed_to_the_bank() {
+    const NUM_TRANSFERS: usize = 20;
+    // Several entries with several transfers each, so the transfers are ordered both within and
+    // across entries.
+    const NUM_TRANSFERS_PER_ENTRY: usize = 3;
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    let recipients: Vec<_> = (0..NUM_TRANSFERS).map(|_| Keypair::new()).collect();
+    let mut payer = test_bank.payer();
+    let mut transactions = Vec::with_capacity(NUM_TRANSFERS);
+    for recipient in &recipients {
+        transactions.push(system_transaction::transfer(
+            payer,
+            &recipient.pubkey(),
+            PAYER_LAMPORTS,
+            test_bank.recent_blockhash(),
+        ));
+        payer = recipient;
+    }
+
+    let mut hash = PARENT_BANK_LAST_ENTRY_HASH;
+    let entries = transactions
+        .chunks(NUM_TRANSFERS_PER_ENTRY)
+        .map(|transactions| next_entry_mut(&mut hash, NUM_HASHES_PER_ENTRY, transactions.to_vec()))
+        .collect();
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(&session, entry_views_for_tests(entries));
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+
+    let bank = test_bank.bank();
+    assert_eq!(
+        bank.get_balance(&test_bank.payer().pubkey()),
+        0,
+        "the payer forwarded its whole balance to the first recipient"
+    );
+    let (last_recipient, other_recipients) = recipients.split_last().unwrap();
+    for recipient in other_recipients {
+        assert_eq!(
+            bank.get_balance(&recipient.pubkey()),
+            0,
+            "balance must be zero since its only balance was forwarded to recipient after it"
+        );
+    }
+
+    assert_eq!(
+        bank.get_balance(&last_recipient.pubkey()),
+        PAYER_LAMPORTS,
+        "last account never forwarded its received balance, so it must contain the initial balance"
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
 #[derive(Debug)]
 enum InvalidEntry {
     /// The first entry does not follow the parent bank's last entry hash.
@@ -460,7 +540,7 @@ fn block_with_invalid_signature_fails_verification(tampering: Tampering) {
     let mut transaction = test_bank.transfer(&recipient, 2);
 
     // The tamperings keep the number of signatures and keys valid, so the transaction passes its
-    // check and only its signature verification fails.
+    // check and executes, and only its signature verification fails.
     match tampering {
         Tampering::SignedByWrongKeypair => sign(&mut transaction, &[test_bank.payer(), &other]),
         Tampering::SignedOverOtherMessage => {
@@ -849,6 +929,181 @@ fn block_with_v1_transaction_passes_verification_only_up_to_max_accounts(
             slot: SLOT,
             bank_id: BANK_ID,
             verification_status: expected_verification_status,
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test]
+fn block_with_transaction_failing_execution_fails_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    // The blockhash is not in the bank, so the transaction cannot be committed. Its signature and
+    // its check are valid, so only its execution fails.
+    let transaction = transfer(test_bank.payer(), &Keypair::new(), 1, BOGUS_HASH);
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            NUM_HASHES_PER_ENTRY,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed(
+                VerificationFailureReason::TransactionExecutionFailed(
+                    TransactionError::BlockhashNotFound
+                )
+            ),
+        }
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+#[test]
+fn block_with_transaction_failing_but_committed_passes_verification() {
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let bank = test_bank.bank();
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    let payer = test_bank.payer();
+    let payer_balance = bank.get_balance(&payer.pubkey());
+    let payer_balance_exceeded = payer_balance.checked_add(1).unwrap();
+    let transaction = system_transaction::transfer(
+        payer,
+        &Keypair::new().pubkey(),
+        payer_balance_exceeded,
+        test_bank.recent_blockhash(),
+    );
+    let signature = transaction.signatures[0];
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            NUM_HASHES_PER_ENTRY,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::Verified,
+        }
+    );
+    assert_matches!(
+        bank.get_signature_status(&signature),
+        Some(Err(TransactionError::InstructionError(0, _)))
+    );
+
+    shutdown_flag.store(true, Ordering::Relaxed);
+    assert_matches!(stage.join(), Ok(()));
+}
+
+const NO_COST_LIMITS: CostTrackerLimits = CostTrackerLimits {
+    account_cost: u64::MAX,
+    block_cost: u64::MAX,
+    allocated_data_size: u64::MAX,
+};
+
+#[test_case(
+    CostTrackerLimits { block_cost: 0, ..NO_COST_LIMITS },
+    TransactionError::WouldExceedMaxBlockCostLimit;
+    "block_cost"
+)]
+#[test_case(
+    CostTrackerLimits { account_cost: 0, ..NO_COST_LIMITS },
+    TransactionError::WouldExceedMaxAccountCostLimit;
+    "account_cost"
+)]
+#[test_case(
+    CostTrackerLimits { allocated_data_size: 0, ..NO_COST_LIMITS },
+    TransactionError::WouldExceedAccountDataBlockLimit;
+    "allocated_data_size"
+)]
+fn block_exceeding_a_cost_limit_fails_verification(
+    cost_limits: CostTrackerLimits,
+    expected_error: TransactionError,
+) {
+    const NEW_ACCOUNT_DATA_SIZE: usize = 1;
+
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    let test_bank = TestBank::new();
+    let bank = test_bank.bank();
+    bank.write_cost_tracker().unwrap().set_limits(cost_limits);
+    let stage = run_scheduler(
+        TEST_SCHEDULER_CONFIG,
+        shutdown_flag.clone(),
+        test_bank.bank_forks(),
+    );
+
+    // Creating an account with data both costs and allocates account data, so the transaction
+    // exceeds whichever limit is zero.
+    let transaction = system_transaction::create_account(
+        test_bank.payer(),
+        &Keypair::new(),
+        test_bank.recent_blockhash(),
+        bank.get_minimum_balance_for_rent_exemption(NEW_ACCOUNT_DATA_SIZE),
+        NEW_ACCOUNT_DATA_SIZE as u64,
+        &system_program::id(),
+    );
+
+    let session: BlockVerificationSession<Started> = stage
+        .begin_block(BANK_ID, SLOT, PARENT_BANK_LAST_ENTRY_HASH)
+        .unwrap();
+    submit_entries(
+        &session,
+        entry_views_for_tests(vec![next_entry(
+            &PARENT_BANK_LAST_ENTRY_HASH,
+            NUM_HASHES_PER_ENTRY,
+            vec![transaction],
+        )]),
+    );
+    let _session: BlockVerificationSession<AllEntriesSubmitted> =
+        session.notify_all_entries_submitted().unwrap();
+
+    assert_eq!(
+        recv_outcome(&stage),
+        BlockVerificationToReplayMessage {
+            slot: SLOT,
+            bank_id: BANK_ID,
+            verification_status: BlockVerificationOutcome::VerificationFailed(
+                VerificationFailureReason::TransactionExecutionFailed(expected_error)
+            ),
         }
     );
 

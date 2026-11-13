@@ -34,6 +34,8 @@ pub const TEST_SCHEDULER_CONFIG: SchedulerConfig = SchedulerConfig {
     max_signature_verifications_in_flight: NonZeroUsize::new(16).unwrap(),
     num_transaction_check_workers: NonZeroUsize::new(2).unwrap(),
     max_transaction_checks_in_flight: NonZeroUsize::new(16).unwrap(),
+    num_transaction_execution_workers: NonZeroUsize::new(2).unwrap(),
+    max_transaction_executions_in_flight: NonZeroUsize::new(16).unwrap(),
 };
 pub const BOGUS_HASH: Hash = Hash::new_from_array([1; _]);
 pub const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
@@ -41,6 +43,7 @@ pub const PARENT_BANK_LAST_ENTRY_HASH: Hash = Hash::new_from_array([2; _]);
 pub const BANK_ID: BankId = BankId::new(1);
 pub const SLOT: Slot = 120;
 pub const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+pub const NUM_HASHES_PER_ENTRY: u64 = 3;
 
 /// The lamports [`TestBank::payer`] has in genesis.
 pub const PAYER_LAMPORTS: u64 = 1_000_000_000;

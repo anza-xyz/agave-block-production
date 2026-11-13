@@ -22,6 +22,7 @@ solana-hash = { workspace = true }
 solana-runtime = { workspace = true }
 solana-runtime-transaction = { workspace = true }
 solana-signature = { workspace = true, features = ["verify"] }
+solana-svm-timings = { workspace = true }
 solana-svm-transaction = { workspace = true }
 solana-transaction = { workspace = true }
 solana-transaction-error = { workspace = true }
@@ -30,6 +31,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 solana-account = { workspace = true }
 solana-address-lookup-table-interface = { workspace = true, features = ["wincode"] }
+solana-cost-model = { path = "../cost-model", features = ["agave-unstable-api"] }
 solana-entry = { path = "../entry", features = ["agave-unstable-api", "dev-context-only-utils"] }
 solana-keypair = { workspace = true }
 solana-leader-schedule = { path = "../leader-schedule", features = ["agave-unstable-api"] }

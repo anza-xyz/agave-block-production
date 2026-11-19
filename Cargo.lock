@@ -74,8 +74,8 @@ name = "agave-block-engine-client"
 version = "4.5.0-alpha.4"
 dependencies = [
  "agave-block-engine-proto",
- "crossbeam-channel",
  "log",
+ "shaq",
  "solana-keypair",
  "solana-perf",
  "solana-signature",

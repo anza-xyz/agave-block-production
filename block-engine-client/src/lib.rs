@@ -12,8 +12,8 @@ use {
         },
         packet::{Meta as ProtoMeta, Packet},
     },
-    crossbeam_channel::{Sender, TrySendError},
     log::{debug, info, warn},
+    shaq::spsc::Producer,
     solana_keypair::Keypair,
     solana_perf::packet::{BytesPacket, BytesPacketBatch, Meta, PacketBatch, PacketFlags},
     solana_signer::Signer,
@@ -76,7 +76,7 @@ impl Default for BlockEngineClientConfig {
 pub struct BlockEngineClient {
     url: String,
     identity: Keypair,
-    packet_sender: Sender<PacketBatch>,
+    packet_producer: Producer<PacketBatch>,
     config: BlockEngineClientConfig,
 }
 
@@ -84,54 +84,53 @@ impl BlockEngineClient {
     pub fn new(
         url: String,
         identity: Keypair,
-        packet_sender: Sender<PacketBatch>,
+        packet_producer: Producer<PacketBatch>,
         config: BlockEngineClientConfig,
     ) -> Self {
         Self {
             url,
             identity,
-            packet_sender,
+            packet_producer,
             config,
         }
     }
 
-    /// Runs the client on its own thread until `cancel` is cancelled or an attempt
-    /// to forward a nonempty packet batch detects that the receiver was dropped.
-    pub fn spawn(self, cancel: CancellationToken) -> io::Result<JoinHandle<()>> {
+    /// Runs the client on its own thread until `cancel` is cancelled.
+    pub fn spawn(mut self, cancel: CancellationToken) -> io::Result<JoinHandle<()>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         thread::Builder::new()
             .name(SOL_BLOCK_ENGINE_CLIENT_THREAD_NAME.into())
             .spawn(move || {
-                let run = self.reconnect_loop(async || {
-                    let channel = connect(&self.url, &self.config).await?;
-                    let access_token =
-                        authenticate(&mut AuthServiceClient::new(channel.clone()), &self.identity)
-                            .await?;
+                let run = self.reconnect_loop(async |client: &mut Self| {
+                    let channel = connect(&client.url, &client.config).await?;
+                    let access_token = authenticate(
+                        &mut AuthServiceClient::new(channel.clone()),
+                        &client.identity,
+                    )
+                    .await?;
                     let mut request = Request::new(SubscribePacketsRequest {});
                     request.metadata_mut().insert("authorization", access_token);
                     let packets = BlockEngineValidatorClient::new(channel)
                         .subscribe_packets(request)
                         .await?
                         .into_inner();
-                    info!("Subscribed to block engine {} packets", self.url);
-                    self.consume(packets).await
+                    info!("Subscribed to block engine {} packets", client.url);
+                    client.consume(packets).await
                 });
                 runtime.block_on(cancel.run_until_cancelled_owned(run));
             })
     }
 
-    /// Runs `session` repeatedly until it fails with `ReceiverDisconnected`,
-    /// waiting `reconnect_backoff` after every other outcome.
-    async fn reconnect_loop(&self, mut session: impl AsyncFnMut() -> Result<(), SessionError>) {
+    /// Runs `session` forever, waiting `reconnect_backoff` after every outcome.
+    async fn reconnect_loop(
+        &mut self,
+        mut session: impl AsyncFnMut(&mut Self) -> Result<(), SessionError>,
+    ) {
         loop {
-            match session().await {
+            match session(self).await {
                 Ok(()) => info!("Block engine {} closed the packet stream", self.url),
-                Err(SessionError::ReceiverDisconnected) => {
-                    info!("Block engine packet receiver disconnected, stopping client");
-                    return;
-                }
                 Err(err) => warn!("Block engine session with {} failed: {err}", self.url),
             }
             time::sleep(self.config.reconnect_backoff).await;
@@ -140,18 +139,18 @@ impl BlockEngineClient {
 
     /// Forwards packets from `packets` until the stream ends (`Ok`) or fails.
     async fn consume(
-        &self,
+        &mut self,
         mut packets: impl Stream<Item = Result<SubscribePacketsResponse, Status>> + Unpin,
     ) -> Result<(), SessionError> {
         while let Some(response) = packets.next().await {
-            self.forward(response?)?;
+            self.forward(response?);
         }
         Ok(())
     }
 
-    fn forward(&self, response: SubscribePacketsResponse) -> Result<(), SessionError> {
+    fn forward(&mut self, response: SubscribePacketsResponse) {
         let Some(batch) = response.batch else {
-            return Ok(());
+            return;
         };
         let packets: BytesPacketBatch = batch
             .packets
@@ -159,18 +158,13 @@ impl BlockEngineClient {
             .filter_map(packet_from_proto)
             .collect();
         if packets.is_empty() {
-            return Ok(());
+            return;
         }
-        match self.packet_sender.try_send(packets.into()) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(packets)) => {
-                debug!(
-                    "Dropping {} block engine packets: receiver is full",
-                    packets.len()
-                );
-                Ok(())
-            }
-            Err(TrySendError::Disconnected(_)) => Err(SessionError::ReceiverDisconnected),
+        if let Err(packets) = self.packet_producer.try_write(packets.into()) {
+            debug!(
+                "Dropping {} block engine packets: receiver is full",
+                packets.len()
+            );
         }
     }
 }
@@ -185,8 +179,6 @@ enum SessionError {
     MissingAccessToken,
     #[error("invalid access token: {0}")]
     InvalidAccessToken(#[from] InvalidMetadataValue),
-    #[error("packet receiver disconnected")]
-    ReceiverDisconnected,
 }
 
 async fn connect(url: &str, config: &BlockEngineClientConfig) -> Result<Channel, SessionError> {
@@ -282,7 +274,7 @@ mod tests {
         agave_block_engine_proto::packet::{
             Meta as ProtoMeta, PacketBatch as ProtoPacketBatch, PacketFlags as ProtoPacketFlags,
         },
-        crossbeam_channel::{Receiver, TryRecvError, bounded},
+        shaq::spsc::{Consumer, pair},
         solana_perf::packet::bytes::Bytes,
         solana_signature::Signature,
         std::{
@@ -297,12 +289,12 @@ mod tests {
     const BACKOFF: Duration = Duration::from_secs(5);
     const HALF_BACKOFF: Duration = Duration::from_millis(2500);
 
-    fn client(capacity: usize) -> (BlockEngineClient, Receiver<PacketBatch>) {
-        let (sender, receiver) = bounded(capacity);
+    fn client(capacity: usize) -> (BlockEngineClient, Consumer<PacketBatch>) {
+        let (producer, receiver) = pair(capacity).unwrap();
         let client = BlockEngineClient::new(
             "http://localhost".into(),
             Keypair::new(),
-            sender,
+            producer,
             BlockEngineClientConfig::default(),
         );
         (client, receiver)
@@ -440,14 +432,14 @@ mod tests {
 
     #[test]
     fn forwards_only_valid_packets() {
-        let (client, receiver) = client(1);
+        let (mut client, mut receiver) = client(1);
         let mut response = response(2);
         response.batch.as_mut().unwrap().packets.push(Packet {
             data: Bytes::from_static(&[1]),
             meta: None,
         });
-        client.forward(response).unwrap();
-        assert_eq!(receiver.try_recv().unwrap().len(), 2);
+        client.forward(response);
+        assert_eq!(receiver.try_read().unwrap().len(), 2);
     }
 
     #[test]
@@ -463,41 +455,34 @@ mod tests {
 
     #[test]
     fn forwards_packet_batches() {
-        let (client, receiver) = client(1);
-        client.forward(response(2)).unwrap();
-        assert_eq!(receiver.try_recv().unwrap().len(), 2);
+        let (mut client, mut receiver) = client(1);
+        client.forward(response(2));
+        assert_eq!(receiver.try_read().unwrap().len(), 2);
     }
 
     #[test]
     fn skips_responses_without_packets() {
-        let (client, receiver) = client(1);
-        client
-            .forward(SubscribePacketsResponse {
-                header: None,
-                batch: None,
-            })
-            .unwrap();
-        client.forward(response(0)).unwrap();
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        let (mut client, mut receiver) = client(1);
+        client.forward(SubscribePacketsResponse {
+            header: None,
+            batch: None,
+        });
+        client.forward(response(0));
+        assert!(receiver.try_read().is_none());
     }
 
     #[test]
     fn drops_batches_when_receiver_is_full() {
-        let (client, receiver) = client(1);
-        client.forward(response(1)).unwrap();
-        client.forward(response(2)).unwrap();
-        assert_eq!(receiver.try_recv().unwrap().len(), 1);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
-    }
-
-    #[test]
-    fn stops_when_receiver_disconnects() {
-        let (client, receiver) = client(1);
-        drop(receiver);
-        assert_matches!(
-            client.forward(response(1)),
-            Err(SessionError::ReceiverDisconnected)
-        );
+        let (mut client, mut receiver) = client(1);
+        let capacity = receiver.capacity();
+        for _ in 0..capacity {
+            client.forward(response(1));
+        }
+        client.forward(response(2));
+        for _ in 0..capacity {
+            assert_eq!(receiver.try_read().unwrap().len(), 1);
+        }
+        assert!(receiver.try_read().is_none());
     }
 
     fn stream(
@@ -508,19 +493,19 @@ mod tests {
 
     #[tokio::test]
     async fn consume_forwards_until_stream_ends() {
-        let (client, receiver) = client(2);
+        let (mut client, mut receiver) = client(2);
         let result = client
             .consume(stream(vec![Ok(response(1)), Ok(response(2))]))
             .await;
         assert_matches!(result, Ok(()));
-        assert_eq!(receiver.try_recv().unwrap().len(), 1);
-        assert_eq!(receiver.try_recv().unwrap().len(), 2);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(receiver.try_read().unwrap().len(), 1);
+        assert_eq!(receiver.try_read().unwrap().len(), 2);
+        assert!(receiver.try_read().is_none());
     }
 
     #[tokio::test]
     async fn consume_stops_at_stream_error() {
-        let (client, receiver) = client(2);
+        let (mut client, mut receiver) = client(2);
         let mut packets = stream(vec![
             Ok(response(1)),
             Err(Status::internal("stream failed")),
@@ -528,28 +513,18 @@ mod tests {
         ]);
         let result = client.consume(&mut packets).await;
         assert_matches!(result, Err(SessionError::Status(_)));
-        assert_eq!(receiver.try_recv().unwrap().len(), 1);
-        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(receiver.try_read().unwrap().len(), 1);
+        assert!(receiver.try_read().is_none());
 
-        assert_eq!(packets.next().await.unwrap().unwrap(), response(2));
-    }
-
-    #[tokio::test]
-    async fn consume_stops_when_receiver_disconnects() {
-        let (client, receiver) = client(1);
-        drop(receiver);
-        let mut packets = stream(vec![Ok(response(1)), Ok(response(2))]);
-        let result = client.consume(&mut packets).await;
-        assert_matches!(result, Err(SessionError::ReceiverDisconnected));
         assert_eq!(packets.next().await.unwrap().unwrap(), response(2));
     }
 
     fn backoff_client() -> BlockEngineClient {
-        let (sender, _receiver) = bounded(1);
+        let (producer, _receiver) = pair(1).unwrap();
         BlockEngineClient::new(
             "http://localhost".into(),
             Keypair::new(),
-            sender,
+            producer,
             BlockEngineClientConfig {
                 reconnect_backoff: BACKOFF,
                 ..BlockEngineClientConfig::default()
@@ -558,16 +533,21 @@ mod tests {
     }
 
     async fn run_sessions(outcomes: Vec<Result<(), SessionError>>) -> Vec<Duration> {
-        let client = backoff_client();
+        let mut client = backoff_client();
+        let cancel = CancellationToken::new();
         let start = Instant::now();
         let mut outcomes = VecDeque::from(outcomes);
         let mut started = Vec::new();
-        client
-            .reconnect_loop(|| {
+        cancel
+            .clone()
+            .run_until_cancelled_owned(client.reconnect_loop(|_: &mut BlockEngineClient| {
                 started.push(start.elapsed());
                 let outcome = outcomes.pop_front().expect("loop ran past its script");
+                if outcomes.is_empty() {
+                    cancel.cancel();
+                }
                 async move { outcome }
-            })
+            }))
             .await;
         started
     }
@@ -577,29 +557,21 @@ mod tests {
         let started = run_sessions(vec![
             Err(SessionError::Status(Status::unavailable("down"))),
             Ok(()),
-            Err(SessionError::ReceiverDisconnected),
+            Err(SessionError::Status(Status::unavailable("down"))),
         ])
         .await;
         assert_eq!(started, [Duration::ZERO, BACKOFF, Duration::from_secs(10)]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn reconnect_loop_stops_without_backoff_when_receiver_disconnects() {
-        let start = Instant::now();
-        let started = run_sessions(vec![Err(SessionError::ReceiverDisconnected)]).await;
-        assert_eq!(started, [Duration::ZERO]);
-        assert_eq!(start.elapsed(), Duration::ZERO);
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn cancellation_stops_loop_during_backoff() {
-        let client = backoff_client();
+        let mut client = backoff_client();
         let cancel = CancellationToken::new();
         let mut sessions = 0;
         let start = Instant::now();
         let run = cancel
             .clone()
-            .run_until_cancelled_owned(client.reconnect_loop(|| {
+            .run_until_cancelled_owned(client.reconnect_loop(|_: &mut BlockEngineClient| {
                 sessions += 1;
                 async { Err(SessionError::Status(Status::unavailable("down"))) }
             }));

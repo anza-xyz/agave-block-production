@@ -8,6 +8,7 @@ members = [
     "banks-client",
     "banks-interface",
     "banks-server",
+    "block-engine-client",
     "block-engine-proto",
     "block-production-scheduler",
     "bloom",
@@ -211,6 +212,7 @@ new_without_default = "allow"
 [workspace.dependencies]
 Inflector = "0.11.4"
 agave-banking-stage-ingress-types = { path = "banking-stage-ingress-types", version = "=4.5.0-alpha.4", features = ["agave-unstable-api"] }
+agave-block-engine-client = { path = "block-engine-client", version = "=4.5.0-alpha.4", features = ["agave-unstable-api"] }
 agave-block-engine-proto = { path = "block-engine-proto", version = "=4.5.0-alpha.4", features = ["agave-unstable-api"] }
 agave-block-production-scheduler = { path = "block-production-scheduler", version = "=4.5.0-alpha.4", features = ["agave-unstable-api"] }
 agave-bls-cert-verify = { path = "bls-cert-verify", version = "=4.5.0-alpha.4", features = ["agave-unstable-api"] }

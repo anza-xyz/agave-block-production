@@ -50,6 +50,7 @@ solana-hash = { workspace = true }
 solana-signature = { workspace = true }
 solana-transaction = { workspace = true, features = ["wincode"] }
 tempfile = { workspace = true }
+test-case = { workspace = true }
 wincode = { workspace = true }
 
 [lints]

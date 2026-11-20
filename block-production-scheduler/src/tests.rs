@@ -1,7 +1,7 @@
 use {
     super::*,
     crate::{
-        check_response::{Payload, TransactionPayload},
+        check_response::{BundlePayload, Payload, TransactionPayload},
         resolved_transaction::ResolvedTransaction,
         tpu_ingress::{
             MAX_PACKETS_PER_CHECK_BATCH, MAX_TPU_PACKETS_PER_ITERATION, TpuTransactionMeta,
@@ -104,21 +104,18 @@ pub(super) fn setup_with_capacities(
     (scheduler, agave)
 }
 
-pub(super) fn insert(
-    scheduler: &mut Scheduler,
-    priority: u64,
-    cost: u64,
-    accounts: &[u8],
-) -> usize {
+fn resolve(scheduler: &Scheduler, writable: &[u8], readonly: &[u8]) -> ResolvedTransaction {
     let bytes = wincode::serialize(&VersionedTransaction {
         signatures: vec![Signature::default()],
         message: VersionedMessage::Legacy(Message {
             header: MessageHeader {
                 num_required_signatures: 1,
+                num_readonly_unsigned_accounts: readonly.len() as u8,
                 ..Default::default()
             },
-            account_keys: accounts
+            account_keys: writable
                 .iter()
+                .chain(readonly)
                 .map(|&key| Pubkey::from([key; 32]))
                 .collect(),
             ..Default::default()
@@ -139,7 +136,7 @@ pub(super) fn insert(
     // SAFETY: no pubkey allocation is needed for a legacy transaction.
     let pubkeys = unsafe { OwnedPubkeysPtr::from_region(None, allocator) };
     // SAFETY: the transaction belongs to this allocator.
-    let transaction = unsafe {
+    unsafe {
         ResolvedTransaction::try_new(
             transaction,
             pubkeys,
@@ -147,19 +144,16 @@ pub(super) fn insert(
             &scheduler.reserved_account_keys,
         )
     }
-    .unwrap();
+    .unwrap()
+}
+
+fn insert_payload(scheduler: &mut Scheduler, priority: u64, cost: u64, payload: Payload) -> usize {
     scheduler
         .transactions
         .insert(
             priority,
             TransactionState {
-                payload: Payload::Transaction(TransactionPayload {
-                    transaction,
-                    metadata: TpuTransactionMeta {
-                        flags: 0,
-                        src_addr: [0; 16],
-                    },
-                }),
+                payload,
                 cost,
                 allocated_accounts_data_size: 1,
                 execution_worker: None,
@@ -168,6 +162,41 @@ pub(super) fn insert(
         .ok()
         .unwrap()
         .0
+}
+
+pub(super) fn insert(
+    scheduler: &mut Scheduler,
+    priority: u64,
+    cost: u64,
+    accounts: &[u8],
+) -> usize {
+    let transaction = resolve(scheduler, accounts, &[]);
+    let payload = Payload::Transaction(TransactionPayload {
+        transaction,
+        metadata: TpuTransactionMeta {
+            flags: 0,
+            src_addr: [0; 16],
+        },
+    });
+    insert_payload(scheduler, priority, cost, payload)
+}
+
+pub(super) fn insert_bundle(
+    scheduler: &mut Scheduler,
+    priority: u64,
+    cost: u64,
+    members: &[(&[u8], &[u8])],
+) -> usize {
+    let members = members
+        .iter()
+        .map(|(writable, readonly)| resolve(scheduler, writable, readonly))
+        .collect();
+    insert_payload(
+        scheduler,
+        priority,
+        cost,
+        Payload::Bundle(BundlePayload { members }),
+    )
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use {
     crate::{
         Scheduler,
-        check_response::{Payload, TransactionPayload, TransactionState},
+        check_response::{BUNDLE_EXECUTION_FLAGS, TransactionState},
         in_flight_tracker::InFlightTracker,
         progress_tracker::SchedulerState,
         scheduling_details::SchedulingSummary,
@@ -47,6 +47,7 @@ impl Scheduler {
         }
         self.scheduling_scratch.reset();
         let scheduled = &mut self.scheduling_scratch.scheduled;
+        let mut num_scheduled = 0usize;
         let mut allowed_workers = allowed_workers(
             &self.workers,
             &self.in_flight,
@@ -73,14 +74,10 @@ impl Scheduler {
             if budget == 0 || allowed_workers.is_empty() {
                 break;
             }
-            let transaction = self.transactions.get(id.id).unwrap();
-            let Payload::Transaction(payload) = &transaction.payload else {
-                unreachable!("bundles are not handled yet");
-            };
-            let worker = match try_schedule_transaction(
+            let transaction_state = self.transactions.get(id.id).unwrap();
+            let worker = match try_schedule(
                 id.id,
-                transaction,
-                payload,
+                transaction_state,
                 &mut self.account_locks,
                 &mut batches,
                 &mut allowed_workers,
@@ -97,17 +94,18 @@ impl Scheduler {
                     continue;
                 }
             };
-            self.scheduled_cost = self.scheduled_cost.saturating_add(transaction.cost);
-            budget = budget.saturating_sub(transaction.cost);
+            num_scheduled = num_scheduled.saturating_add(transaction_state.num_transactions());
+            self.scheduled_cost = self.scheduled_cost.saturating_add(transaction_state.cost);
+            budget = budget.saturating_sub(transaction_state.cost);
             scheduled.push((id, worker));
         }
 
         batches.send_all(&mut ThreadSet::none());
-        summary.num_scheduled = scheduled.len();
+        summary.num_scheduled = num_scheduled;
         self.leader_slot_metrics.scheduled_transactions = self
             .leader_slot_metrics
             .scheduled_transactions
-            .saturating_add(scheduled.len());
+            .saturating_add(num_scheduled);
         for (id, worker) in scheduled.drain(..) {
             self.transactions.dequeue(&id);
             self.transactions.get_mut(id.id).unwrap().execution_worker = Some(worker);
@@ -115,20 +113,19 @@ impl Scheduler {
     }
 }
 
-fn try_schedule_transaction(
+fn try_schedule(
     id: usize,
-    transaction: &TransactionState,
-    payload: &TransactionPayload,
+    transaction_state: &TransactionState,
     account_locks: &mut ThreadAwareAccountLocks,
     batches: &mut ExecutionBatches<'_>,
     allowed_workers: &mut ThreadSet,
 ) -> Result<ThreadId, TryLockError> {
-    let account_keys = transaction.account_keys_with_writable();
+    let account_keys = transaction_state.account_keys_with_writable();
     let worker =
         account_locks.try_lock_accounts(account_keys.clone(), *allowed_workers, |eligible| {
             select_worker(eligible, batches)
         })?;
-    if !batches.try_push(worker, id, transaction, payload, allowed_workers) {
+    if !batches.try_push(worker, id, transaction_state, allowed_workers) {
         account_locks.unlock_accounts(account_keys, worker);
         return Err(TryLockError::ThreadNotAllowed);
     }
@@ -198,6 +195,7 @@ struct WorkerBatch<'a> {
     batch: Option<ExecutionBatch<'a>>,
     cost_units: u64,
     entry_bytes: u64,
+    flags: u16,
 }
 
 impl Default for WorkerBatch<'_> {
@@ -206,6 +204,7 @@ impl Default for WorkerBatch<'_> {
             batch: None,
             cost_units: 0,
             entry_bytes: ENTRY_OVERHEAD_BYTES,
+            flags: 0,
         }
     }
 }
@@ -283,16 +282,18 @@ impl<'a> ExecutionBatches<'a> {
     }
 
     /// Prepares and appends a transaction, returning false if the worker becomes unavailable.
+    /// A bundle takes an empty batch to itself, which is then sent like a full batch.
     fn try_push(
         &mut self,
         worker: ThreadId,
         id: usize,
-        transaction: &TransactionState,
-        payload: &TransactionPayload,
+        transaction_state: &TransactionState,
         allowed_workers: &mut ThreadSet,
     ) -> bool {
-        let transaction_bytes = payload.transaction.view.data().len() as u64;
-        if self.should_send_before(worker, transaction_bytes) {
+        let transaction_bytes = transaction_state.serialized_size();
+        let needs_empty_batch =
+            transaction_state.is_bundle() && self.pending_worker_batches[worker].len() > 0;
+        if needs_empty_batch || self.should_send_before(worker, transaction_bytes) {
             self.send_all(allowed_workers);
         }
         if !allowed_workers.contains(worker) {
@@ -300,12 +301,14 @@ impl<'a> ExecutionBatches<'a> {
         }
         let pending = &mut self.pending_worker_batches[worker];
         let batch = pending.batch.as_mut().expect("batch has been prepared");
-        // SAFETY: the scheduler retains this allocation until execution completes.
-        let region = unsafe { payload.transaction.to_region(self.allocator) };
-        // SAFETY: the region belongs to this allocator and remains retained by the scheduler.
-        unsafe { batch.try_push(region, id) }.expect("full batches are sent immediately");
-        pending.cost_units = pending.cost_units.saturating_add(transaction.cost);
-        pending.entry_bytes = pending.entry_bytes.saturating_add(u64::from(region.length));
+        // SAFETY: the scheduler retains these allocations until execution completes.
+        for region in unsafe { transaction_state.to_regions(self.allocator) } {
+            // SAFETY: the region belongs to this allocator and remains retained by the scheduler.
+            unsafe { batch.try_push(region, id) }.expect("full batches are sent immediately");
+        }
+        pending.entry_bytes = pending.entry_bytes.saturating_add(transaction_bytes);
+        pending.cost_units = pending.cost_units.saturating_add(transaction_state.cost);
+        pending.flags = transaction_state.execution_flags();
 
         if self.should_send(worker) {
             // Match greedy: reaching a batch target sends all pending batches.
@@ -320,6 +323,7 @@ impl<'a> ExecutionBatches<'a> {
     fn should_send(&self, worker: ThreadId) -> bool {
         let pending = &self.pending_worker_batches[worker];
         pending.len() == MAX_TRANSACTIONS_PER_BATCH
+            || pending.flags == BUNDLE_EXECUTION_FLAGS
             || pending.cost_units >= self.max_cost_units_per_batch
             || pending.entry_bytes >= self.target_entry_bytes_per_batch
     }
@@ -343,6 +347,7 @@ impl<'a> ExecutionBatches<'a> {
         };
         let cost = core::mem::take(&mut pending.cost_units);
         pending.entry_bytes = ENTRY_OVERHEAD_BYTES;
+        let flags = core::mem::take(&mut pending.flags);
         let count = batch.len();
         if batch.is_empty() {
             // SAFETY: this unpublished container contains no transactions.
@@ -352,7 +357,7 @@ impl<'a> ExecutionBatches<'a> {
         let queue = &mut self.workers[worker].pack_to_worker;
         queue
             .try_write(PackToExecutionWorkerMessage {
-                flags: 0,
+                flags,
                 max_working_slot: self.slot,
                 batch: batch.to_sharable_transaction_batch_region(),
             })
@@ -385,7 +390,10 @@ impl<'a> ExecutionBatches<'a> {
 mod tests {
     use {
         super::*,
-        crate::tests::{insert, setup_with_capacities, setup_with_workers},
+        crate::{
+            check_response::Payload,
+            tests::{insert, insert_bundle, setup_with_capacities, setup_with_workers},
+        },
         agave_scheduler_handshake::AgaveSession,
         core::time::Duration,
         solana_pubkey::Pubkey,
@@ -436,6 +444,42 @@ mod tests {
             assert_eq!(region.offset, expected_region.offset);
             state.execution_worker = None;
         }
+        // SAFETY: the test worker is done; only the container is freed, not retained transactions.
+        unsafe { batch.free() };
+    }
+
+    fn assert_bundle_batch(
+        scheduler: &mut Scheduler,
+        agave: &mut AgaveSession,
+        worker: usize,
+        expected: usize,
+    ) {
+        let message = agave.workers[worker].pack_to_worker.try_read().unwrap();
+        assert_eq!(message.max_working_slot, 100);
+        assert_eq!(message.flags, BUNDLE_EXECUTION_FLAGS);
+        // SAFETY: the scheduler published this initialized batch, now exclusively held here.
+        let batch = unsafe {
+            ExecutionBatch::from_sharable_transaction_batch_region(
+                &message.batch,
+                &scheduler.allocator,
+            )
+        };
+        let state = scheduler.transactions.get_mut(expected).unwrap();
+        assert_eq!(state.execution_worker, Some(worker));
+        let Payload::Bundle(bundle) = &state.payload else {
+            panic!("expected a bundle");
+        };
+        assert_eq!(batch.len(), bundle.members.len());
+        for ((transaction, id), member) in batch.iter().zip(&bundle.members) {
+            assert_eq!(id, expected);
+            // SAFETY: both pointers belong to the scheduler allocator and are still retained.
+            let region =
+                unsafe { transaction.to_sharable_transaction_region(&scheduler.allocator) };
+            // SAFETY: this retained transaction belongs to the scheduler allocator.
+            let expected_region = unsafe { member.to_region(&scheduler.allocator) };
+            assert_eq!(region.offset, expected_region.offset);
+        }
+        state.execution_worker = None;
         // SAFETY: the test worker is done; only the container is freed, not retained transactions.
         unsafe { batch.free() };
     }
@@ -675,5 +719,191 @@ mod tests {
         assert_eq!(scheduler.transactions.pop_highest(), Some(blocked));
         assert!(agave.workers[1].pack_to_worker.try_read().is_none());
         assert_batch(&mut scheduler, &mut agave, 0, &[first]);
+    }
+
+    #[test]
+    fn sends_pending_batch_before_bundle_in_its_own_batch() {
+        let (mut scheduler, mut agave) = setup();
+        let first = insert(&mut scheduler, 3, 100, &[1]);
+        let bundle = insert_bundle(&mut scheduler, 2, 10, &[(&[1], &[]), (&[2], &[])]);
+        let last = insert(&mut scheduler, 1, 1, &[1]);
+
+        scheduler.schedule(1_000);
+
+        assert_eq!(scheduler.scheduled_cost, 111);
+        assert_eq!(scheduler.in_flight.worker_load(0).batches, 3);
+        assert_eq!(scheduler.in_flight.worker_load(0).transactions, 4);
+        assert_eq!(scheduler.scheduling_details.sum_num_scheduled, 4);
+        assert_eq!(scheduler.leader_slot_metrics.scheduled_transactions, 4);
+        assert!(scheduler.transactions.pop_highest().is_none());
+        assert_batch(&mut scheduler, &mut agave, 0, &[first]);
+        assert_bundle_batch(&mut scheduler, &mut agave, 0, bundle);
+        assert_batch(&mut scheduler, &mut agave, 0, &[last]);
+        assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+        assert!(agave.workers[1].pack_to_worker.try_read().is_none());
+    }
+
+    #[test]
+    fn releases_bundle_locks_when_flushing_makes_worker_unavailable() {
+        let (mut scheduler, mut agave) = setup();
+        let queue_capacity = scheduler.workers[0].pack_to_worker.capacity();
+        for _ in 0..queue_capacity - 1 {
+            scheduler.in_flight.track_batch(0, 0, 0);
+        }
+        let first = insert(&mut scheduler, 2, 1, &[1]);
+        let bundle = insert_bundle(&mut scheduler, 1, 1, &[(&[1], &[]), (&[3], &[])]);
+
+        scheduler.schedule(1_000);
+
+        assert_eq!(scheduler.scheduled_cost, 1);
+        assert_eq!(scheduler.scheduling_details.sum_unschedulable_threads, 1);
+        assert_eq!(scheduler.transactions.pop_highest(), Some(bundle));
+        assert_eq!(
+            scheduler.transactions.get(bundle).unwrap().execution_worker,
+            None
+        );
+        assert_batch(&mut scheduler, &mut agave, 0, &[first]);
+        assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+        let account = Pubkey::from([3; 32]);
+        assert_eq!(
+            scheduler.account_locks.try_lock_accounts(
+                [(&account, true)].into_iter(),
+                ThreadSet::any(2),
+                |_| 1,
+            ),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn bundle_locks_duplicate_keys_on_one_worker() {
+        const KEY: u8 = 5;
+        type Member = (&'static [u8], &'static [u8]);
+        let shapes: [(Member, Member, bool); 4] = [
+            ((&[1, KEY], &[]), (&[2, KEY], &[]), true),
+            ((&[1, KEY], &[]), (&[2], &[KEY]), true),
+            ((&[1], &[KEY]), (&[2, KEY], &[]), true),
+            ((&[1], &[KEY]), (&[2], &[KEY]), false),
+        ];
+        for (first, second, writable) in shapes {
+            let (mut scheduler, mut agave) = setup();
+            let bundle = insert_bundle(&mut scheduler, 1, 1, &[first, second]);
+
+            scheduler.schedule(1_000);
+
+            let key = Pubkey::from([KEY; 32]);
+            let lock_on_other_worker = |scheduler: &mut Scheduler, writable| {
+                scheduler.account_locks.try_lock_accounts(
+                    [(&key, writable)].into_iter(),
+                    ThreadSet::only(1),
+                    |_| 1,
+                )
+            };
+            assert_eq!(
+                lock_on_other_worker(&mut scheduler, true),
+                Err(TryLockError::ThreadNotAllowed)
+            );
+            if writable {
+                assert_eq!(
+                    lock_on_other_worker(&mut scheduler, false),
+                    Err(TryLockError::ThreadNotAllowed)
+                );
+            } else {
+                assert_eq!(lock_on_other_worker(&mut scheduler, false), Ok(1));
+                scheduler
+                    .account_locks
+                    .unlock_accounts([(&key, false)].into_iter(), 1);
+            }
+            assert_bundle_batch(&mut scheduler, &mut agave, 0, bundle);
+        }
+    }
+
+    #[test]
+    fn bundle_in_empty_pending_batch_sends_other_workers_partial_batches() {
+        let (mut scheduler, mut agave) = setup();
+        let first = insert(&mut scheduler, 3, 100, &[1]);
+        let bundle = insert_bundle(&mut scheduler, 2, 10, &[(&[2], &[]), (&[3], &[])]);
+        let last = insert(&mut scheduler, 1, 1, &[1]);
+
+        scheduler.schedule(1_000);
+
+        assert_eq!(scheduler.scheduled_cost, 111);
+        assert!(scheduler.transactions.pop_highest().is_none());
+        assert_batch(&mut scheduler, &mut agave, 0, &[first]);
+        assert_batch(&mut scheduler, &mut agave, 0, &[last]);
+        assert_bundle_batch(&mut scheduler, &mut agave, 1, bundle);
+        assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+        assert!(agave.workers[1].pack_to_worker.try_read().is_none());
+    }
+
+    #[test]
+    fn bundle_may_cross_worker_cost_limit() {
+        let (mut scheduler, mut agave) = setup();
+        scheduler.max_cost_units_per_worker = 150;
+        let first = insert(&mut scheduler, 3, 100, &[1]);
+        let bundle = insert_bundle(&mut scheduler, 2, 100, &[(&[1], &[]), (&[2], &[])]);
+        let deferred = insert(&mut scheduler, 1, 1, &[1]);
+
+        scheduler.schedule(1_000);
+
+        assert_eq!(scheduler.scheduled_cost, 200);
+        assert_eq!(scheduler.in_flight.worker_load(0).cost_units, 200);
+        assert_eq!(scheduler.scheduling_details.sum_unschedulable_threads, 1);
+        assert_eq!(scheduler.transactions.pop_highest(), Some(deferred));
+        assert_batch(&mut scheduler, &mut agave, 0, &[first]);
+        assert_bundle_batch(&mut scheduler, &mut agave, 0, bundle);
+        assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+    }
+
+    #[test]
+    fn interleaves_bundles_with_transactions_in_priority_order() {
+        let (mut scheduler, mut agave) = setup_with_capacities(2, 2, 2, 8, 8);
+        scheduler.state = SchedulerState::LeaderReady {
+            slot: 100,
+            remaining_cost_units: 1_000,
+            slot_start: Instant::now(),
+            slot_duration: Duration::from_millis(400),
+        };
+        scheduler.handle_slot_change();
+        let first = insert(&mut scheduler, 5, 1, &[1]);
+        let second = insert(&mut scheduler, 4, 1, &[1]);
+        let first_bundle = insert_bundle(&mut scheduler, 3, 1, &[(&[1], &[]), (&[2], &[])]);
+        let third = insert(&mut scheduler, 2, 1, &[1]);
+        let second_bundle = insert_bundle(&mut scheduler, 1, 1, &[(&[3], &[]), (&[1], &[])]);
+
+        scheduler.schedule(1_000);
+
+        assert_eq!(scheduler.scheduled_cost, 5);
+        assert_eq!(scheduler.in_flight.worker_load(0).batches, 4);
+        assert_eq!(scheduler.in_flight.worker_load(0).transactions, 7);
+        assert!(scheduler.transactions.pop_highest().is_none());
+        assert_batch(&mut scheduler, &mut agave, 0, &[first, second]);
+        assert_bundle_batch(&mut scheduler, &mut agave, 0, first_bundle);
+        assert_batch(&mut scheduler, &mut agave, 0, &[third]);
+        assert_bundle_batch(&mut scheduler, &mut agave, 0, second_bundle);
+        assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+        assert!(agave.workers[1].pack_to_worker.try_read().is_none());
+    }
+
+    #[test]
+    fn schedules_multiple_bundles_across_workers() {
+        let (mut scheduler, mut agave) = setup();
+        let first = insert_bundle(&mut scheduler, 4, 10, &[(&[1], &[]), (&[2], &[])]);
+        let second = insert_bundle(&mut scheduler, 3, 10, &[(&[3], &[]), (&[4], &[])]);
+        let same_worker = insert_bundle(&mut scheduler, 2, 10, &[(&[5], &[]), (&[1], &[])]);
+        let blocked = insert_bundle(&mut scheduler, 1, 10, &[(&[2], &[]), (&[3], &[])]);
+
+        scheduler.schedule(1_000);
+
+        assert_eq!(scheduler.scheduled_cost, 30);
+        assert_eq!(scheduler.in_flight.worker_load(0).batches, 2);
+        assert_eq!(scheduler.in_flight.worker_load(1).batches, 1);
+        assert_eq!(scheduler.scheduling_details.sum_unschedulable_conflicts, 1);
+        assert_eq!(scheduler.transactions.pop_highest(), Some(blocked));
+        assert_bundle_batch(&mut scheduler, &mut agave, 0, first);
+        assert_bundle_batch(&mut scheduler, &mut agave, 0, same_worker);
+        assert_bundle_batch(&mut scheduler, &mut agave, 1, second);
+        assert!(agave.workers[0].pack_to_worker.try_read().is_none());
+        assert!(agave.workers[1].pack_to_worker.try_read().is_none());
     }
 }

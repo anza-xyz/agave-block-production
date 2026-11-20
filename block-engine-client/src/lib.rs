@@ -7,9 +7,10 @@ use {
             auth_service_client::AuthServiceClient,
         },
         block_engine::{
-            SubscribePacketsRequest, SubscribePacketsResponse,
-            block_engine_validator_client::BlockEngineValidatorClient,
+            SubscribeBundlesRequest, SubscribeBundlesResponse, SubscribePacketsRequest,
+            SubscribePacketsResponse, block_engine_validator_client::BlockEngineValidatorClient,
         },
+        bundle::BundleUuid,
         packet::{Meta as ProtoMeta, Packet},
     },
     log::{debug, info, warn},
@@ -71,12 +72,55 @@ impl Default for BlockEngineClientConfig {
     }
 }
 
-/// Authenticates with a block engine as a validator and forwards the packets it
-/// streams. Reconnects with a fixed backoff after any failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockEngineMessage {
+    Packets(PacketBatch),
+    Bundles(Vec<BlockEngineBundle>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockEngineBundle {
+    pub uuid: String,
+    pub packets: PacketBatch,
+}
+
+impl TryFrom<BundleUuid> for BlockEngineBundle {
+    type Error = BundleError;
+
+    fn try_from(bundle: BundleUuid) -> Result<Self, Self::Error> {
+        let BundleUuid { bundle, uuid } = bundle;
+        let packets = bundle
+            .ok_or(BundleError::Missing)?
+            .packets
+            .into_iter()
+            .map(|packet| packet_from_proto(packet).ok_or(BundleError::InvalidMember))
+            .collect::<Result<Vec<_>, _>>()?;
+        if packets.is_empty() {
+            return Err(BundleError::Empty);
+        }
+        Ok(Self {
+            uuid,
+            packets: PacketBatch::from(packets),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum BundleError {
+    #[error("bundle is missing")]
+    Missing,
+    #[error("bundle has no packets")]
+    Empty,
+    #[error("bundle has a dropped member")]
+    InvalidMember,
+}
+
+/// Authenticates with a block engine as a validator and forwards the packets
+/// and bundles it streams. Reconnects with a fixed backoff after any failure.
 pub struct BlockEngineClient {
     url: String,
     identity: Keypair,
-    packet_producer: Producer<PacketBatch>,
+    producer: Producer<BlockEngineMessage>,
     config: BlockEngineClientConfig,
 }
 
@@ -84,13 +128,13 @@ impl BlockEngineClient {
     pub fn new(
         url: String,
         identity: Keypair,
-        packet_producer: Producer<PacketBatch>,
+        producer: Producer<BlockEngineMessage>,
         config: BlockEngineClientConfig,
     ) -> Self {
         Self {
             url,
             identity,
-            packet_producer,
+            producer,
             config,
         }
     }
@@ -110,14 +154,28 @@ impl BlockEngineClient {
                         &client.identity,
                     )
                     .await?;
-                    let mut request = Request::new(SubscribePacketsRequest {});
-                    request.metadata_mut().insert("authorization", access_token);
-                    let packets = BlockEngineValidatorClient::new(channel)
-                        .subscribe_packets(request)
+                    let mut packets_request = Request::new(SubscribePacketsRequest {});
+                    packets_request
+                        .metadata_mut()
+                        .insert("authorization", access_token.clone());
+                    let mut bundles_request = Request::new(SubscribeBundlesRequest {});
+                    bundles_request
+                        .metadata_mut()
+                        .insert("authorization", access_token);
+                    let mut validator = BlockEngineValidatorClient::new(channel);
+                    let packets = validator
+                        .subscribe_packets(packets_request)
                         .await?
                         .into_inner();
-                    info!("Subscribed to block engine {} packets", client.url);
-                    client.consume(packets).await
+                    let bundles = validator
+                        .subscribe_bundles(bundles_request)
+                        .await?
+                        .into_inner();
+                    info!(
+                        "Subscribed to block engine {} packets and bundles",
+                        client.url
+                    );
+                    client.consume(packets, bundles).await
                 });
                 runtime.block_on(cancel.run_until_cancelled_owned(run));
             })
@@ -130,25 +188,34 @@ impl BlockEngineClient {
     ) {
         loop {
             match session(self).await {
-                Ok(()) => info!("Block engine {} closed the packet stream", self.url),
+                Ok(()) => info!("Block engine {} closed a stream", self.url),
                 Err(err) => warn!("Block engine session with {} failed: {err}", self.url),
             }
             time::sleep(self.config.reconnect_backoff).await;
         }
     }
 
-    /// Forwards packets from `packets` until the stream ends (`Ok`) or fails.
+    /// Forwards packets and bundles until either stream ends (`Ok`) or fails.
     async fn consume(
         &mut self,
         mut packets: impl Stream<Item = Result<SubscribePacketsResponse, Status>> + Unpin,
+        mut bundles: impl Stream<Item = Result<SubscribeBundlesResponse, Status>> + Unpin,
     ) -> Result<(), SessionError> {
-        while let Some(response) = packets.next().await {
-            self.forward(response?);
+        loop {
+            tokio::select! {
+                response = packets.next() => match response {
+                    Some(response) => self.forward_packets(response?),
+                    None => return Ok(()),
+                },
+                response = bundles.next() => match response {
+                    Some(response) => self.forward_bundles(response?),
+                    None => return Ok(()),
+                },
+            }
         }
-        Ok(())
     }
 
-    fn forward(&mut self, response: SubscribePacketsResponse) {
+    fn forward_packets(&mut self, response: SubscribePacketsResponse) {
         let Some(batch) = response.batch else {
             return;
         };
@@ -160,11 +227,32 @@ impl BlockEngineClient {
         if packets.is_empty() {
             return;
         }
-        if let Err(packets) = self.packet_producer.try_write(packets.into()) {
-            debug!(
-                "Dropping {} block engine packets: receiver is full",
-                packets.len()
-            );
+        let len = packets.len();
+        if self
+            .producer
+            .try_write(BlockEngineMessage::Packets(packets.into()))
+            .is_err()
+        {
+            debug!("Dropping {len} block engine packets: receiver is full");
+        }
+    }
+
+    fn forward_bundles(&mut self, response: SubscribeBundlesResponse) {
+        let bundles: Vec<_> = response
+            .bundles
+            .into_iter()
+            .filter_map(|bundle| BlockEngineBundle::try_from(bundle).ok())
+            .collect();
+        if bundles.is_empty() {
+            return;
+        }
+        let len = bundles.len();
+        if self
+            .producer
+            .try_write(BlockEngineMessage::Bundles(bundles))
+            .is_err()
+        {
+            debug!("Dropping {len} block engine bundles: receiver is full");
         }
     }
 }
@@ -271,8 +359,11 @@ fn meta_from_proto(proto_meta: &ProtoMeta, size: usize) -> Meta {
 mod tests {
     use {
         super::*,
-        agave_block_engine_proto::packet::{
-            Meta as ProtoMeta, PacketBatch as ProtoPacketBatch, PacketFlags as ProtoPacketFlags,
+        agave_block_engine_proto::{
+            bundle::Bundle,
+            packet::{
+                Meta as ProtoMeta, PacketBatch as ProtoPacketBatch, PacketFlags as ProtoPacketFlags,
+            },
         },
         shaq::spsc::{Consumer, pair},
         solana_perf::packet::bytes::Bytes,
@@ -283,13 +374,14 @@ mod tests {
             net::{IpAddr, Ipv4Addr, Ipv6Addr},
         },
         tokio::time::Instant,
+        tokio_stream::pending,
         tokio_util::sync::CancellationToken,
     };
 
     const BACKOFF: Duration = Duration::from_secs(5);
     const HALF_BACKOFF: Duration = Duration::from_millis(2500);
 
-    fn client(capacity: usize) -> (BlockEngineClient, Consumer<PacketBatch>) {
+    fn client(capacity: usize) -> (BlockEngineClient, Consumer<BlockEngineMessage>) {
         let (producer, receiver) = pair(capacity).unwrap();
         let client = BlockEngineClient::new(
             "http://localhost".into(),
@@ -298,6 +390,20 @@ mod tests {
             BlockEngineClientConfig::default(),
         );
         (client, receiver)
+    }
+
+    fn read_packets(receiver: &mut Consumer<BlockEngineMessage>) -> PacketBatch {
+        let BlockEngineMessage::Packets(packets) = receiver.try_read().unwrap() else {
+            panic!("expected packets");
+        };
+        packets
+    }
+
+    fn read_bundles(receiver: &mut Consumer<BlockEngineMessage>) -> Vec<BlockEngineBundle> {
+        let BlockEngineMessage::Bundles(bundles) = receiver.try_read().unwrap() else {
+            panic!("expected bundles");
+        };
+        bundles
     }
 
     fn packet(data: &[u8], size: u64, addr: &str, flags: ProtoPacketFlags) -> Packet {
@@ -323,6 +429,25 @@ mod tests {
             batch: Some(ProtoPacketBatch {
                 packets: vec![valid_packet(); packets],
             }),
+        }
+    }
+
+    fn bundle(uuid: &str, packets: Vec<Packet>) -> BundleUuid {
+        BundleUuid {
+            bundle: Some(Bundle {
+                header: None,
+                packets,
+            }),
+            uuid: uuid.into(),
+        }
+    }
+
+    fn bundles_response(uuids: &[&str]) -> SubscribeBundlesResponse {
+        SubscribeBundlesResponse {
+            bundles: uuids
+                .iter()
+                .map(|uuid| bundle(uuid, vec![valid_packet()]))
+                .collect(),
         }
     }
 
@@ -438,8 +563,8 @@ mod tests {
             data: Bytes::from_static(&[1]),
             meta: None,
         });
-        client.forward(response);
-        assert_eq!(receiver.try_read().unwrap().len(), 2);
+        client.forward_packets(response);
+        assert_eq!(read_packets(&mut receiver).len(), 2);
     }
 
     #[test]
@@ -456,18 +581,18 @@ mod tests {
     #[test]
     fn forwards_packet_batches() {
         let (mut client, mut receiver) = client(1);
-        client.forward(response(2));
-        assert_eq!(receiver.try_read().unwrap().len(), 2);
+        client.forward_packets(response(2));
+        assert_eq!(read_packets(&mut receiver).len(), 2);
     }
 
     #[test]
     fn skips_responses_without_packets() {
         let (mut client, mut receiver) = client(1);
-        client.forward(SubscribePacketsResponse {
+        client.forward_packets(SubscribePacketsResponse {
             header: None,
             batch: None,
         });
-        client.forward(response(0));
+        client.forward_packets(response(0));
         assert!(receiver.try_read().is_none());
     }
 
@@ -476,30 +601,28 @@ mod tests {
         let (mut client, mut receiver) = client(1);
         let capacity = receiver.capacity();
         for _ in 0..capacity {
-            client.forward(response(1));
+            client.forward_packets(response(1));
         }
-        client.forward(response(2));
+        client.forward_packets(response(2));
         for _ in 0..capacity {
-            assert_eq!(receiver.try_read().unwrap().len(), 1);
+            assert_eq!(read_packets(&mut receiver).len(), 1);
         }
         assert!(receiver.try_read().is_none());
     }
 
-    fn stream(
-        items: Vec<Result<SubscribePacketsResponse, Status>>,
-    ) -> impl Stream<Item = Result<SubscribePacketsResponse, Status>> + Unpin {
+    fn stream<T>(items: Vec<Result<T, Status>>) -> impl Stream<Item = Result<T, Status>> + Unpin {
         tokio_stream::iter(items)
     }
 
     #[tokio::test]
-    async fn consume_forwards_until_stream_ends() {
+    async fn consume_forwards_packets_until_stream_ends() {
         let (mut client, mut receiver) = client(2);
         let result = client
-            .consume(stream(vec![Ok(response(1)), Ok(response(2))]))
+            .consume(stream(vec![Ok(response(1)), Ok(response(2))]), pending())
             .await;
         assert_matches!(result, Ok(()));
-        assert_eq!(receiver.try_read().unwrap().len(), 1);
-        assert_eq!(receiver.try_read().unwrap().len(), 2);
+        assert_eq!(read_packets(&mut receiver).len(), 1);
+        assert_eq!(read_packets(&mut receiver).len(), 2);
         assert!(receiver.try_read().is_none());
     }
 
@@ -511,12 +634,179 @@ mod tests {
             Err(Status::internal("stream failed")),
             Ok(response(2)),
         ]);
-        let result = client.consume(&mut packets).await;
+        let result = client.consume(&mut packets, pending()).await;
         assert_matches!(result, Err(SessionError::Status(_)));
-        assert_eq!(receiver.try_read().unwrap().len(), 1);
+        assert_eq!(read_packets(&mut receiver).len(), 1);
         assert!(receiver.try_read().is_none());
 
         assert_eq!(packets.next().await.unwrap().unwrap(), response(2));
+    }
+
+    #[tokio::test]
+    async fn consume_forwards_bundles_until_stream_ends() {
+        let (mut client, mut receiver) = client(2);
+        let bundles = stream(vec![
+            Ok(bundles_response(&["first"])),
+            Ok(bundles_response(&["second", "third"])),
+        ]);
+        let result = client.consume(pending(), bundles).await;
+        assert_matches!(result, Ok(()));
+        let uuids = |bundles: Vec<BlockEngineBundle>| {
+            bundles
+                .into_iter()
+                .map(|bundle| bundle.uuid)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(uuids(read_bundles(&mut receiver)), ["first"]);
+        assert_eq!(uuids(read_bundles(&mut receiver)), ["second", "third"]);
+        assert!(receiver.try_read().is_none());
+    }
+
+    #[tokio::test]
+    async fn consume_stops_at_bundle_stream_error() {
+        let (mut client, mut receiver) = client(2);
+        let mut bundles = stream(vec![
+            Ok(bundles_response(&["first"])),
+            Err(Status::internal("stream failed")),
+            Ok(bundles_response(&["second"])),
+        ]);
+        let result = client.consume(pending(), &mut bundles).await;
+        assert_matches!(result, Err(SessionError::Status(_)));
+        assert_eq!(read_bundles(&mut receiver).len(), 1);
+        assert!(receiver.try_read().is_none());
+        assert_eq!(
+            bundles.next().await.unwrap().unwrap(),
+            bundles_response(&["second"])
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consume_forwards_from_both_streams() {
+        let (mut client, mut receiver) = client(4);
+        let packets = stream(vec![Ok(response(1)), Ok(response(2))]).chain(pending());
+        let bundles = stream(vec![Ok(bundles_response(&["bundle"]))]).chain(pending());
+        let result = time::timeout(BACKOFF, client.consume(packets, bundles)).await;
+        assert!(result.is_err());
+        let (mut packets, mut bundles) = (Vec::new(), Vec::new());
+        while let Some(message) = receiver.try_read() {
+            match message {
+                BlockEngineMessage::Packets(batch) => packets.push(batch.len()),
+                BlockEngineMessage::Bundles(received) => bundles.extend(received),
+            }
+        }
+        assert_eq!(packets, [1, 2]);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].uuid, "bundle");
+    }
+
+    #[test]
+    fn converts_bundle_members() {
+        let bundle = BlockEngineBundle::try_from(bundle(
+            "uuid",
+            vec![
+                valid_packet(),
+                packet(&[4, 5, 0], 2, "::1", ProtoPacketFlags::default()),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(bundle.uuid, "uuid");
+        assert_eq!(
+            bundle
+                .packets
+                .iter()
+                .map(|packet| packet.data(..).unwrap())
+                .collect::<Vec<_>>(),
+            [&[1, 2, 3][..], &[4, 5]]
+        );
+    }
+
+    #[test]
+    fn rejects_bundle_with_discarded_packet() {
+        let discard = ProtoPacketFlags {
+            discard: true,
+            ..ProtoPacketFlags::default()
+        };
+        let bundle = bundle(
+            "discarded",
+            vec![valid_packet(), packet(&[1], 1, "", discard)],
+        );
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle),
+            Err(BundleError::InvalidMember)
+        );
+    }
+
+    #[test]
+    fn rejects_bundle_with_malformed_packet() {
+        let bundle = bundle(
+            "malformed",
+            vec![
+                valid_packet(),
+                packet(&[1], 2, "", ProtoPacketFlags::default()),
+            ],
+        );
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle),
+            Err(BundleError::InvalidMember)
+        );
+    }
+
+    #[test]
+    fn rejects_bundle_without_packets() {
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle("empty", vec![])),
+            Err(BundleError::Empty)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_bundle() {
+        let bundle = BundleUuid {
+            bundle: None,
+            uuid: "missing".into(),
+        };
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle),
+            Err(BundleError::Missing)
+        );
+    }
+
+    #[test]
+    fn forwards_only_complete_bundles() {
+        let (mut client, mut receiver) = client(1);
+        client.forward_bundles(SubscribeBundlesResponse {
+            bundles: vec![
+                bundle("complete", vec![valid_packet()]),
+                bundle("empty", vec![]),
+            ],
+        });
+        let bundles = read_bundles(&mut receiver);
+        assert_eq!(
+            bundles
+                .iter()
+                .map(|bundle| bundle.uuid.as_str())
+                .collect::<Vec<_>>(),
+            ["complete"]
+        );
+
+        client.forward_bundles(SubscribeBundlesResponse {
+            bundles: vec![bundle("empty", vec![])],
+        });
+        assert!(receiver.try_read().is_none());
+    }
+
+    #[test]
+    fn drops_bundles_when_receiver_is_full() {
+        let (mut client, mut receiver) = client(1);
+        let capacity = receiver.capacity();
+        for _ in 0..capacity {
+            client.forward_bundles(bundles_response(&["kept"]));
+        }
+        client.forward_bundles(bundles_response(&["dropped"]));
+        for _ in 0..capacity {
+            assert_eq!(read_bundles(&mut receiver)[0].uuid, "kept");
+        }
+        assert!(receiver.try_read().is_none());
     }
 
     fn backoff_client() -> BlockEngineClient {

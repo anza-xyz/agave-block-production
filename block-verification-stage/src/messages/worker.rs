@@ -57,12 +57,14 @@ pub(crate) enum TransactionCheckError {
 pub(crate) struct TransactionExecutionRequest {
     pub(crate) bank_id: BankId,
     pub(crate) slot: Slot,
+    pub(crate) worker_index: usize,
     pub(crate) transaction: Box<ReplayTransaction>,
 }
 
 #[derive(Debug)]
 pub(crate) struct TransactionExecutionResponse {
     pub(crate) bank_id: BankId,
+    pub(crate) worker_index: usize,
     pub(crate) result: Result<(), TransactionExecutionError>,
 }
 

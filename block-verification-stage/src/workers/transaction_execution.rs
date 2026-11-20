@@ -25,11 +25,13 @@ pub(crate) fn execute_transaction(
     TransactionExecutionRequest {
         bank_id,
         slot,
+        worker_index,
         transaction,
     }: TransactionExecutionRequest,
 ) -> TransactionExecutionResponse {
     TransactionExecutionResponse {
         bank_id,
+        worker_index,
         result: execute(bank_forks, bank_id, slot, &transaction),
     }
 }

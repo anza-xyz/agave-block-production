@@ -16,7 +16,7 @@ use {
     log::{debug, info, warn},
     shaq::spsc::Producer,
     solana_keypair::Keypair,
-    solana_perf::packet::{BytesPacket, BytesPacketBatch, Meta, PacketBatch, PacketFlags},
+    solana_perf::packet::{BytesPacket, BytesPacketBatch, Meta, PacketFlags},
     solana_signer::Signer,
     std::{
         io,
@@ -74,14 +74,14 @@ impl Default for BlockEngineClientConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockEngineMessage {
-    Packets(PacketBatch),
+    Packets(BytesPacketBatch),
     Bundles(Vec<BlockEngineBundle>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockEngineBundle {
     pub uuid: String,
-    pub packets: PacketBatch,
+    pub packets: BytesPacketBatch,
 }
 
 impl TryFrom<BundleUuid> for BlockEngineBundle {
@@ -89,19 +89,15 @@ impl TryFrom<BundleUuid> for BlockEngineBundle {
 
     fn try_from(bundle: BundleUuid) -> Result<Self, Self::Error> {
         let BundleUuid { bundle, uuid } = bundle;
-        let packets = bundle
-            .ok_or(BundleError::Missing)?
-            .packets
-            .into_iter()
-            .map(|packet| packet_from_proto(packet).ok_or(BundleError::InvalidMember))
-            .collect::<Result<Vec<_>, _>>()?;
-        if packets.is_empty() {
+        let members = bundle.ok_or(BundleError::Missing)?.packets;
+        if members.is_empty() {
             return Err(BundleError::Empty);
         }
-        Ok(Self {
-            uuid,
-            packets: PacketBatch::from(packets),
-        })
+        let mut packets = BytesPacketBatch::with_capacity(members.len());
+        for member in members {
+            packets.push(packet_from_proto(member).ok_or(BundleError::InvalidMember)?);
+        }
+        Ok(Self { uuid, packets })
     }
 }
 
@@ -219,18 +215,15 @@ impl BlockEngineClient {
         let Some(batch) = response.batch else {
             return;
         };
-        let packets: BytesPacketBatch = batch
-            .packets
-            .into_iter()
-            .filter_map(packet_from_proto)
-            .collect();
+        let mut packets = BytesPacketBatch::with_capacity(batch.packets.len());
+        packets.extend(batch.packets.into_iter().filter_map(packet_from_proto));
         if packets.is_empty() {
             return;
         }
         let len = packets.len();
         if self
             .producer
-            .try_write(BlockEngineMessage::Packets(packets.into()))
+            .try_write(BlockEngineMessage::Packets(packets))
             .is_err()
         {
             debug!("Dropping {len} block engine packets: receiver is full");
@@ -392,7 +385,7 @@ mod tests {
         (client, receiver)
     }
 
-    fn read_packets(receiver: &mut Consumer<BlockEngineMessage>) -> PacketBatch {
+    fn read_packets(receiver: &mut Consumer<BlockEngineMessage>) -> BytesPacketBatch {
         let BlockEngineMessage::Packets(packets) = receiver.try_read().unwrap() else {
             panic!("expected packets");
         };

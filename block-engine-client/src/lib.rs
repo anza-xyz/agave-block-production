@@ -84,6 +84,37 @@ pub struct BlockEngineBundle {
     pub packets: PacketBatch,
 }
 
+impl TryFrom<BundleUuid> for BlockEngineBundle {
+    type Error = BundleError;
+
+    fn try_from(bundle: BundleUuid) -> Result<Self, Self::Error> {
+        let BundleUuid { bundle, uuid } = bundle;
+        let packets = bundle
+            .ok_or(BundleError::Missing)?
+            .packets
+            .into_iter()
+            .map(|packet| packet_from_proto(packet).ok_or(BundleError::InvalidMember))
+            .collect::<Result<Vec<_>, _>>()?;
+        if packets.is_empty() {
+            return Err(BundleError::Empty);
+        }
+        Ok(Self {
+            uuid,
+            packets: PacketBatch::from(packets),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum BundleError {
+    #[error("bundle is missing")]
+    Missing,
+    #[error("bundle has no packets")]
+    Empty,
+    #[error("bundle has a dropped member")]
+    InvalidMember,
+}
+
 /// Authenticates with a block engine as a validator and forwards the packets
 /// and bundles it streams. Reconnects with a fixed backoff after any failure.
 pub struct BlockEngineClient {
@@ -196,28 +227,32 @@ impl BlockEngineClient {
         if packets.is_empty() {
             return;
         }
-        self.send(BlockEngineMessage::Packets(packets.into()));
+        let len = packets.len();
+        if self
+            .producer
+            .try_write(BlockEngineMessage::Packets(packets.into()))
+            .is_err()
+        {
+            debug!("Dropping {len} block engine packets: receiver is full");
+        }
     }
 
     fn forward_bundles(&mut self, response: SubscribeBundlesResponse) {
         let bundles: Vec<_> = response
             .bundles
             .into_iter()
-            .filter_map(bundle_from_proto)
+            .filter_map(|bundle| BlockEngineBundle::try_from(bundle).ok())
             .collect();
         if bundles.is_empty() {
             return;
         }
-        self.send(BlockEngineMessage::Bundles(bundles));
-    }
-
-    fn send(&mut self, message: BlockEngineMessage) {
-        if let Err(message) = self.producer.try_write(message) {
-            let (len, kind) = match &message {
-                BlockEngineMessage::Packets(packets) => (packets.len(), "packets"),
-                BlockEngineMessage::Bundles(bundles) => (bundles.len(), "bundles"),
-            };
-            debug!("Dropping {len} block engine {kind}: receiver is full");
+        let len = bundles.len();
+        if self
+            .producer
+            .try_write(BlockEngineMessage::Bundles(bundles))
+            .is_err()
+        {
+            debug!("Dropping {len} block engine bundles: receiver is full");
         }
     }
 }
@@ -318,22 +353,6 @@ fn meta_from_proto(proto_meta: &ProtoMeta, size: usize) -> Meta {
     meta.flags
         .set(PacketFlags::FROM_STAKED_NODE, flags.from_staked_node);
     meta
-}
-
-fn bundle_from_proto(bundle: BundleUuid) -> Option<BlockEngineBundle> {
-    let BundleUuid { bundle, uuid } = bundle;
-    let packets = bundle?
-        .packets
-        .into_iter()
-        .map(packet_from_proto)
-        .collect::<Option<Vec<_>>>()?;
-    if packets.is_empty() {
-        return None;
-    }
-    Some(BlockEngineBundle {
-        uuid,
-        packets: PacketBatch::from(packets),
-    })
 }
 
 #[cfg(test)]
@@ -682,7 +701,7 @@ mod tests {
 
     #[test]
     fn converts_bundle_members() {
-        let bundle = bundle_from_proto(bundle(
+        let bundle = BlockEngineBundle::try_from(bundle(
             "uuid",
             vec![
                 valid_packet(),
@@ -711,7 +730,10 @@ mod tests {
             "discarded",
             vec![valid_packet(), packet(&[1], 1, "", discard)],
         );
-        assert_eq!(bundle_from_proto(bundle), None);
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle),
+            Err(BundleError::InvalidMember)
+        );
     }
 
     #[test]
@@ -723,12 +745,18 @@ mod tests {
                 packet(&[1], 2, "", ProtoPacketFlags::default()),
             ],
         );
-        assert_eq!(bundle_from_proto(bundle), None);
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle),
+            Err(BundleError::InvalidMember)
+        );
     }
 
     #[test]
     fn rejects_bundle_without_packets() {
-        assert_eq!(bundle_from_proto(bundle("empty", vec![])), None);
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle("empty", vec![])),
+            Err(BundleError::Empty)
+        );
     }
 
     #[test]
@@ -737,7 +765,10 @@ mod tests {
             bundle: None,
             uuid: "missing".into(),
         };
-        assert_eq!(bundle_from_proto(bundle), None);
+        assert_eq!(
+            BlockEngineBundle::try_from(bundle),
+            Err(BundleError::Missing)
+        );
     }
 
     #[test]

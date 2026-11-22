@@ -10,10 +10,11 @@ use {
     agave_scheduler_bindings::SharableTransactionRegion,
     agave_scheduler_handshake::{AgaveSession, ClientLogon, server::Server, setup_local_session},
     agave_scheduling_utils::{pubkeys_ptr::OwnedPubkeysPtr, transaction_ptr::OwnedTransactionPtr},
+    solana_keypair::write_keypair_file,
     solana_message::{Message, MessageHeader, VersionedMessage},
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
-    std::{os::unix::net::UnixListener, path::Path, sync::Arc, thread},
+    std::{assert_matches, os::unix::net::UnixListener, path::Path, sync::Arc, thread},
 };
 
 mod scheduling_flows;
@@ -43,6 +44,7 @@ fn config(path: &Path) -> Config {
             max_cost_units_per_batch: 1_000_000,
             target_entry_bytes_per_batch: 4_622,
         },
+        block_engine: None,
     }
 }
 
@@ -93,6 +95,7 @@ pub(super) fn setup_with_capacities(
         1_000_000,
         1_000_000,
         4_622,
+        None,
     )
     .unwrap();
     scheduler.state = SchedulerState::LeaderReady {
@@ -213,6 +216,7 @@ fn config_uses_shared_defaults_and_overrides() {
         scheduler.max_cost_units_per_worker
     );
     assert_eq!(config.scheduler.execution_margin, Duration::from_millis(10));
+    assert!(config.block_engine.is_none());
 
     let config = Config::from_toml(
         r"
@@ -251,6 +255,117 @@ fn config_requires_path_and_rejects_unknown_fields() {
     assert!(
         Config::from_toml("ipc_path = '/ledger/socket'\n[scheduler]\nfilter_keys = ['invalid']")
             .is_err()
+    );
+}
+
+#[test]
+fn config_enables_block_engine_with_section() {
+    let config = Config::from_toml(
+        r"
+ipc_path = '/ledger/socket'
+[block_engine]
+url = 'https://block-engine.example'
+keypair_path = '/keys/identity.json'
+",
+    )
+    .unwrap();
+    let block_engine = config.block_engine.unwrap();
+    assert_eq!(block_engine.url, "https://block-engine.example");
+    assert_eq!(block_engine.keypair_path, Path::new("/keys/identity.json"));
+    assert_eq!(block_engine.block_engine_to_pack_capacity, 1024);
+
+    let config = Config::from_toml(
+        r"
+ipc_path = '/ledger/socket'
+[block_engine]
+url = 'https://block-engine.example'
+keypair_path = '/keys/identity.json'
+block_engine_to_pack_capacity = 16
+",
+    )
+    .unwrap();
+    assert_eq!(
+        config.block_engine.unwrap().block_engine_to_pack_capacity,
+        16
+    );
+}
+
+#[test]
+fn config_rejects_incomplete_block_engine_section() {
+    for block_engine in [
+        "keypair_path = '/keys/identity.json'",
+        "url = 'https://block-engine.example'",
+        "url = 'https://block-engine.example'\nkeypair_path = '/keys/identity.json'\nunknown = 1",
+    ] {
+        let source = format!("ipc_path = '/ledger/socket'\n[block_engine]\n{block_engine}");
+        assert!(Config::from_toml(&source).is_err(), "{block_engine}");
+    }
+}
+
+fn block_engine_config(keypair_path: PathBuf) -> BlockEngineConfig {
+    BlockEngineConfig {
+        url: "http://127.0.0.1:1".to_string(), // bad url
+        keypair_path,
+        block_engine_to_pack_capacity: 16,
+    }
+}
+
+#[test]
+fn load_block_engine_without_config() {
+    assert_matches!(load_block_engine(None), Ok(None));
+}
+
+#[test]
+fn load_block_engine_reads_keypair() {
+    let directory = tempfile::tempdir().unwrap();
+    let keypair_path = directory.path().join("identity.json");
+    let keypair = Keypair::new();
+    write_keypair_file(&keypair, &keypair_path).unwrap();
+
+    let (config, identity) = load_block_engine(Some(block_engine_config(keypair_path.clone())))
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.keypair_path, keypair_path);
+    assert_eq!(identity.to_bytes(), keypair.to_bytes());
+}
+
+#[test]
+fn load_block_engine_rejects_missing_keypair() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+
+    assert_matches!(
+        load_block_engine(Some(block_engine_config(missing.clone()))),
+        Err(SchedulerError::BlockEngineKeypair { path, .. }) if path == missing
+    );
+}
+
+#[test]
+fn spawn_block_engine_without_config() {
+    let (consumer, client) = spawn_block_engine(None).unwrap();
+    assert_matches!(client, BlockEngineHandle::Off);
+    assert!(consumer.is_none());
+    client.stop();
+}
+
+#[test]
+fn spawn_block_engine_stops_running_client() {
+    let config = block_engine_config(PathBuf::from("/unused"));
+    let (_consumer, client) = spawn_block_engine(Some((config, Keypair::new()))).unwrap();
+    assert_matches!(client, BlockEngineHandle::Running { .. });
+    client.stop();
+}
+
+#[test]
+fn run_fails_on_missing_block_engine_keypair() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing.json");
+    let mut config = config(&directory.path().join("scheduler.ipc"));
+    config.block_engine = Some(block_engine_config(missing.clone()));
+
+    assert_matches!(
+        run(config, &AtomicBool::new(false)),
+        Err(SchedulerError::BlockEngineKeypair { path, .. }) if path == missing
     );
 }
 

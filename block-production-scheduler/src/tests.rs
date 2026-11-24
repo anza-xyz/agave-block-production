@@ -1,11 +1,10 @@
 use {
     super::*,
     crate::{
+        check_batch::MAX_PACKETS_PER_CHECK_BATCH,
         check_response::{BundlePayload, Payload, TransactionPayload},
         resolved_transaction::ResolvedTransaction,
-        tpu_ingress::{
-            MAX_PACKETS_PER_CHECK_BATCH, MAX_TPU_PACKETS_PER_ITERATION, TpuTransactionMeta,
-        },
+        tpu_ingress::{MAX_TPU_PACKETS_PER_ITERATION, TpuTransactionMeta},
     },
     agave_scheduler_bindings::SharableTransactionRegion,
     agave_scheduler_handshake::{AgaveSession, ClientLogon, server::Server, setup_local_session},

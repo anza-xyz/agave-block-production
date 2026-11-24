@@ -1,6 +1,9 @@
 #![cfg(feature = "agave-unstable-api")]
 
+mod metrics;
+
 use {
+    crate::metrics::ClientMetrics,
     agave_block_engine_proto::{
         auth::{
             GenerateAuthChallengeRequest, GenerateAuthTokensRequest, Role,
@@ -13,7 +16,7 @@ use {
         bundle::BundleUuid,
         packet::{Meta as ProtoMeta, Packet},
     },
-    log::{debug, info, warn},
+    log::{info, warn},
     shaq::spsc::Producer,
     solana_keypair::Keypair,
     solana_perf::packet::{BytesPacket, BytesPacketBatch, Meta, PacketFlags},
@@ -95,7 +98,7 @@ impl TryFrom<BundleUuid> for BlockEngineBundle {
         }
         let mut packets = BytesPacketBatch::with_capacity(members.len());
         for member in members {
-            packets.push(packet_from_proto(member).ok_or(BundleError::InvalidMember)?);
+            packets.push(packet_from_proto(member).map_err(|_| BundleError::InvalidMember)?);
         }
         Ok(Self { uuid, packets })
     }
@@ -118,6 +121,7 @@ pub struct BlockEngineClient {
     identity: Keypair,
     producer: Producer<BlockEngineMessage>,
     config: BlockEngineClientConfig,
+    metrics: ClientMetrics,
 }
 
 impl BlockEngineClient {
@@ -132,6 +136,7 @@ impl BlockEngineClient {
             identity,
             producer,
             config,
+            metrics: ClientMetrics::default(),
         }
     }
 
@@ -184,9 +189,16 @@ impl BlockEngineClient {
     ) {
         loop {
             match session(self).await {
-                Ok(()) => info!("Block engine {} closed a stream", self.url),
-                Err(err) => warn!("Block engine session with {} failed: {err}", self.url),
+                Ok(()) => {
+                    info!("Block engine {} closed a stream", self.url);
+                    self.metrics.streams_closed = self.metrics.streams_closed.saturating_add(1);
+                }
+                Err(err) => {
+                    warn!("Block engine session with {} failed: {err}", self.url);
+                    self.metrics.record_session_error(&err);
+                }
             }
+            self.metrics.maybe_report();
             time::sleep(self.config.reconnect_backoff).await;
         }
     }
@@ -208,44 +220,77 @@ impl BlockEngineClient {
                     None => return Ok(()),
                 },
             }
+            self.metrics.maybe_report();
         }
     }
 
     fn forward_packets(&mut self, response: SubscribePacketsResponse) {
-        let Some(batch) = response.batch else {
+        let metrics = &mut self.metrics;
+        let Some(batch) = response.batch.filter(|batch| !batch.packets.is_empty()) else {
+            metrics.empty_packet_responses = metrics.empty_packet_responses.saturating_add(1);
             return;
         };
+        metrics.received_packets = metrics.received_packets.saturating_add(batch.packets.len());
         let mut packets = BytesPacketBatch::with_capacity(batch.packets.len());
-        packets.extend(batch.packets.into_iter().filter_map(packet_from_proto));
-        if packets.is_empty() {
-            return;
+        for packet in batch.packets {
+            match packet_from_proto(packet) {
+                Ok(packet) => packets.push(packet),
+                Err(PacketError::Discarded) => {
+                    metrics.discarded_packets = metrics.discarded_packets.saturating_add(1);
+                }
+                Err(PacketError::Malformed) => {
+                    metrics.malformed_packets = metrics.malformed_packets.saturating_add(1);
+                }
+            }
         }
-        let len = packets.len();
-        if self
-            .producer
-            .try_write(BlockEngineMessage::Packets(packets))
-            .is_err()
-        {
-            debug!("Dropping {len} block engine packets: receiver is full");
+        if !packets.is_empty() {
+            let len = packets.len();
+            if self
+                .producer
+                .try_write(BlockEngineMessage::Packets(packets))
+                .is_ok()
+            {
+                metrics.forwarded_packets = metrics.forwarded_packets.saturating_add(len);
+            } else {
+                metrics.queue_full_dropped_packets =
+                    metrics.queue_full_dropped_packets.saturating_add(len);
+            }
         }
     }
 
     fn forward_bundles(&mut self, response: SubscribeBundlesResponse) {
-        let bundles: Vec<_> = response
-            .bundles
-            .into_iter()
-            .filter_map(|bundle| BlockEngineBundle::try_from(bundle).ok())
-            .collect();
-        if bundles.is_empty() {
-            return;
+        let metrics = &mut self.metrics;
+        metrics.received_bundles = metrics
+            .received_bundles
+            .saturating_add(response.bundles.len());
+        let mut bundles = Vec::with_capacity(response.bundles.len());
+        for bundle in response.bundles {
+            match BlockEngineBundle::try_from(bundle) {
+                Ok(bundle) => bundles.push(bundle),
+                Err(BundleError::Missing) => {
+                    metrics.missing_bundles = metrics.missing_bundles.saturating_add(1);
+                }
+                Err(BundleError::Empty) => {
+                    metrics.empty_bundles = metrics.empty_bundles.saturating_add(1);
+                }
+                Err(BundleError::InvalidMember) => {
+                    metrics.invalid_member_bundles =
+                        metrics.invalid_member_bundles.saturating_add(1);
+                }
+            }
         }
-        let len = bundles.len();
-        if self
-            .producer
-            .try_write(BlockEngineMessage::Bundles(bundles))
-            .is_err()
-        {
-            debug!("Dropping {len} block engine bundles: receiver is full");
+        if !bundles.is_empty() {
+            let len = bundles.len();
+            if self
+                .producer
+                .try_write(BlockEngineMessage::Bundles(bundles))
+                .is_ok()
+            {
+                metrics.forwarded_bundles = metrics.forwarded_bundles.saturating_add(len);
+            } else {
+                metrics.queue_full_dropped_bundles =
+                    metrics.queue_full_dropped_bundles.saturating_add(len);
+            }
         }
     }
 }
@@ -309,22 +354,27 @@ fn auth_tokens_request(identity: &Keypair, challenge: &str) -> GenerateAuthToken
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PacketError {
+    Discarded,
+    Malformed,
+}
+
 /// Converts a block engine packet into a [`BytesPacket`].
-/// Returns `None` for discarded packets and packets with missing or
-/// inconsistent metadata.
-fn packet_from_proto(packet: Packet) -> Option<BytesPacket> {
+fn packet_from_proto(packet: Packet) -> Result<BytesPacket, PacketError> {
     let Packet { data, meta } = packet;
-    let meta = meta?;
+    let meta = meta.ok_or(PacketError::Malformed)?;
 
     // Nothing really blocks outside engine to just spam packets with flag set to discarded
     // so lets skip them early
     if meta.flags.as_ref().is_some_and(|flags| flags.discard) {
-        return None;
+        return Err(PacketError::Discarded);
     }
     let size = usize::try_from(meta.size)
         .ok()
-        .filter(|&size| size != 0 && size <= data.len())?;
-    Some(BytesPacket::new(
+        .filter(|&size| size != 0 && size <= data.len())
+        .ok_or(PacketError::Malformed)?;
+    Ok(BytesPacket::new(
         data.slice(..size),
         meta_from_proto(&meta, size),
     ))
@@ -536,15 +586,18 @@ mod tests {
             data: Bytes::from_static(&[1]),
             meta: None,
         };
+        assert_eq!(
+            packet_from_proto(packet(&[1], 1, "127.0.0.1", discard)),
+            Err(PacketError::Discarded)
+        );
         for packet in [
             no_meta,
-            packet(&[1], 1, "127.0.0.1", discard),
             packet(&[1], 0, "127.0.0.1", ProtoPacketFlags::default()),
             packet(&[1], 2, "127.0.0.1", ProtoPacketFlags::default()),
             packet(&[1], u64::MAX, "127.0.0.1", ProtoPacketFlags::default()),
             packet(&[], 0, "127.0.0.1", ProtoPacketFlags::default()),
         ] {
-            assert_eq!(packet_from_proto(packet), None);
+            assert_eq!(packet_from_proto(packet), Err(PacketError::Malformed));
         }
     }
 
@@ -552,12 +605,24 @@ mod tests {
     fn forwards_only_valid_packets() {
         let (mut client, mut receiver) = client(1);
         let mut response = response(2);
-        response.batch.as_mut().unwrap().packets.push(Packet {
-            data: Bytes::from_static(&[1]),
-            meta: None,
-        });
+        let discard = ProtoPacketFlags {
+            discard: true,
+            ..ProtoPacketFlags::default()
+        };
+        response.batch.as_mut().unwrap().packets.extend([
+            Packet {
+                data: Bytes::from_static(&[1]),
+                meta: None,
+            },
+            packet(&[1], 1, "127.0.0.1", discard),
+        ]);
         client.forward_packets(response);
         assert_eq!(read_packets(&mut receiver).len(), 2);
+        let metrics = &client.metrics;
+        assert_eq!(metrics.received_packets, 4);
+        assert_eq!(metrics.malformed_packets, 1);
+        assert_eq!(metrics.discarded_packets, 1);
+        assert_eq!(metrics.forwarded_packets, 2);
     }
 
     #[test]
@@ -587,6 +652,7 @@ mod tests {
         });
         client.forward_packets(response(0));
         assert!(receiver.try_read().is_none());
+        assert_eq!(client.metrics.empty_packet_responses, 2);
     }
 
     #[test]
@@ -601,6 +667,8 @@ mod tests {
             assert_eq!(read_packets(&mut receiver).len(), 1);
         }
         assert!(receiver.try_read().is_none());
+        assert_eq!(client.metrics.forwarded_packets, capacity);
+        assert_eq!(client.metrics.queue_full_dropped_packets, 2);
     }
 
     fn stream<T>(items: Vec<Result<T, Status>>) -> impl Stream<Item = Result<T, Status>> + Unpin {
@@ -771,6 +839,14 @@ mod tests {
             bundles: vec![
                 bundle("complete", vec![valid_packet()]),
                 bundle("empty", vec![]),
+                BundleUuid {
+                    bundle: None,
+                    uuid: "missing".into(),
+                },
+                bundle(
+                    "invalid",
+                    vec![packet(&[1], 2, "", ProtoPacketFlags::default())],
+                ),
             ],
         });
         let bundles = read_bundles(&mut receiver);
@@ -786,6 +862,12 @@ mod tests {
             bundles: vec![bundle("empty", vec![])],
         });
         assert!(receiver.try_read().is_none());
+        let metrics = &client.metrics;
+        assert_eq!(metrics.received_bundles, 5);
+        assert_eq!(metrics.empty_bundles, 2);
+        assert_eq!(metrics.missing_bundles, 1);
+        assert_eq!(metrics.invalid_member_bundles, 1);
+        assert_eq!(metrics.forwarded_bundles, 1);
     }
 
     #[test]
@@ -800,6 +882,8 @@ mod tests {
             assert_eq!(read_bundles(&mut receiver)[0].uuid, "kept");
         }
         assert!(receiver.try_read().is_none());
+        assert_eq!(client.metrics.forwarded_bundles, capacity);
+        assert_eq!(client.metrics.queue_full_dropped_bundles, 1);
     }
 
     fn backoff_client() -> BlockEngineClient {
@@ -815,7 +899,9 @@ mod tests {
         )
     }
 
-    async fn run_sessions(outcomes: Vec<Result<(), SessionError>>) -> Vec<Duration> {
+    async fn run_sessions(
+        outcomes: Vec<Result<(), SessionError>>,
+    ) -> (Vec<Duration>, ClientMetrics) {
         let mut client = backoff_client();
         let cancel = CancellationToken::new();
         let start = Instant::now();
@@ -832,18 +918,36 @@ mod tests {
                 async move { outcome }
             }))
             .await;
-        started
+        (started, client.metrics)
     }
 
     #[tokio::test(start_paused = true)]
     async fn reconnect_loop_waits_backoff_after_closed_stream_and_errors() {
-        let started = run_sessions(vec![
+        let (started, _) = run_sessions(vec![
             Err(SessionError::Status(Status::unavailable("down"))),
             Ok(()),
             Err(SessionError::Status(Status::unavailable("down"))),
         ])
         .await;
         assert_eq!(started, [Duration::ZERO, BACKOFF, Duration::from_secs(10)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_loop_counts_session_outcomes() {
+        let invalid_token = "\n".parse::<AsciiMetadataValue>().unwrap_err();
+        let (_, metrics) = run_sessions(vec![
+            Ok(()),
+            Err(SessionError::Status(Status::unavailable("down"))),
+            Err(SessionError::MissingAccessToken),
+            Err(SessionError::InvalidAccessToken(invalid_token)),
+            Err(SessionError::Status(Status::unavailable("down"))),
+        ])
+        .await;
+        assert_eq!(metrics.streams_closed, 1);
+        assert_eq!(metrics.status_errors, 2);
+        assert_eq!(metrics.missing_access_token_errors, 1);
+        assert_eq!(metrics.invalid_access_token_errors, 1);
+        assert_eq!(metrics.transport_errors, 0);
     }
 
     #[tokio::test(start_paused = true)]

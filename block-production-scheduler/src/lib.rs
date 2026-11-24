@@ -31,6 +31,14 @@ use {
 
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the verifier is spawned by upcoming block engine wiring"
+    )
+)]
+mod block_engine_verifier;
 mod check_batch;
 mod check_response;
 mod config;

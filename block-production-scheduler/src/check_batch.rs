@@ -1,12 +1,16 @@
 use {
     crate::tpu_ingress::TpuTransactionMeta,
-    agave_scheduler_bindings::PackToCheckWorkerMessage,
+    agave_scheduler_bindings::{PackToCheckWorkerMessage, check_message_flags},
     agave_scheduling_utils::transaction_ptr::{OwnedTransactionPtr, TransactionPtrBatch},
     core::mem::ManuallyDrop,
     rts_alloc::Allocator,
 };
 
 pub(super) const MAX_PACKETS_PER_CHECK_BATCH: usize = 16;
+pub(super) const CHECK_FLAGS: u16 = check_message_flags::AGE_NONCE_CHECKS
+    | check_message_flags::LOAD_FEE_PAYER_BALANCE
+    | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES
+    | check_message_flags::CALCULATE_SCHEDULING_DETAILS;
 
 pub(super) type RawCheckBatch<'a> =
     TransactionPtrBatch<'a, TpuTransactionMeta, MAX_PACKETS_PER_CHECK_BATCH>;
@@ -104,11 +108,7 @@ impl Drop for CheckBatch<'_> {
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        crate::tests::setup,
-        agave_scheduler_bindings::{SharableTransactionRegion, check_message_flags},
-    };
+    use {super::*, crate::tests::setup, agave_scheduler_bindings::SharableTransactionRegion};
 
     fn transaction(allocator: &Allocator) -> OwnedTransactionPtr<'_> {
         let ptr = allocator.allocate(1).unwrap();

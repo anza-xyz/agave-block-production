@@ -92,6 +92,7 @@ pub(super) fn setup_with_capacities(
         1_000_000,
         1_000_000,
         4_622,
+        None,
     )
     .unwrap();
     scheduler.state = SchedulerState::LeaderReady {

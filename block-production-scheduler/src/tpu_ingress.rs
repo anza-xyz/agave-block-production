@@ -1,6 +1,9 @@
 use {
-    crate::{Scheduler, check_batch::dispatch_to_check, progress_tracker::SchedulerState},
-    agave_scheduler_bindings::check_message_flags,
+    crate::{
+        Scheduler,
+        check_batch::{CHECK_FLAGS, dispatch_to_check},
+        progress_tracker::SchedulerState,
+    },
     agave_scheduling_utils::transaction_ptr::OwnedTransactionPtr,
     core::{num::NonZeroUsize, time::Duration},
 };
@@ -8,10 +11,6 @@ use {
 const TPU_READABLE_TIMEOUT: Duration = Duration::from_millis(10);
 pub(super) const MAX_TPU_PACKETS_PER_ITERATION: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 const TPU_ACCEPTANCE_SLOT_WINDOW: u64 = 20;
-const CHECK_FLAGS: u16 = check_message_flags::AGE_NONCE_CHECKS
-    | check_message_flags::LOAD_FEE_PAYER_BALANCE
-    | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES
-    | check_message_flags::CALCULATE_SCHEDULING_DETAILS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -78,7 +77,7 @@ impl Scheduler {
     }
 }
 
-fn should_accept_packets(state: &SchedulerState) -> bool {
+pub(super) fn should_accept_packets(state: &SchedulerState) -> bool {
     match state {
         SchedulerState::LeaderStarting { .. } | SchedulerState::LeaderReady { .. } => true,
         SchedulerState::NotLeader {

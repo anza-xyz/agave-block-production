@@ -31,6 +31,7 @@ use {
 
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+mod check_batch;
 mod check_response;
 mod config;
 mod execution_response;

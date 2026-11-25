@@ -16,6 +16,14 @@ pub(super) struct LeaderSlotMetrics {
     pub(super) scheduled_transactions: usize,
     /// Transactions reported as included by execution workers.
     pub(super) completed_transactions: usize,
+    /// Verified block engine packets dequeued outside bundles, before checks or capacity rejection.
+    pub(super) block_engine_packets: usize,
+    /// Block engine packets dropped at ingress.
+    pub(super) block_engine_dropped_packets: usize,
+    /// Verified block engine bundles dequeued.
+    pub(super) block_engine_bundles: usize,
+    /// Block engine bundles dropped at ingress.
+    pub(super) block_engine_dropped_bundles: usize,
 }
 
 impl LeaderSlotMetrics {
@@ -32,6 +40,18 @@ impl LeaderSlotMetrics {
             ("dropped_transactions", self.dropped_transactions, i64),
             ("scheduled_transactions", self.scheduled_transactions, i64),
             ("completed_transactions", self.completed_transactions, i64),
+            ("block_engine_packets", self.block_engine_packets, i64),
+            (
+                "block_engine_dropped_packets",
+                self.block_engine_dropped_packets,
+                i64
+            ),
+            ("block_engine_bundles", self.block_engine_bundles, i64),
+            (
+                "block_engine_dropped_bundles",
+                self.block_engine_dropped_bundles,
+                i64
+            ),
         );
     }
 }

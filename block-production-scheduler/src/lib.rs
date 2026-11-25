@@ -3,10 +3,10 @@
 
 use {
     crate::{
-        check_response::TransactionState, in_flight_tracker::InFlightTracker,
-        leader_slot_metrics::LeaderSlotMetrics, progress_tracker::SchedulerState,
-        schedule::SchedulerScratch, scheduling_details::SchedulingDetails,
-        transaction_container::TransactionContainer,
+        block_engine_verifier::VerifiedMessage, check_response::TransactionState,
+        in_flight_tracker::InFlightTracker, leader_slot_metrics::LeaderSlotMetrics,
+        progress_tracker::SchedulerState, schedule::SchedulerScratch,
+        scheduling_details::SchedulingDetails, transaction_container::TransactionContainer,
     },
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_scheduler_bindings::{
@@ -31,6 +31,16 @@ use {
 
 const CONNECTION_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
+mod block_engine_ingress;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the verifier is spawned by upcoming block engine wiring"
+    )
+)]
+mod block_engine_verifier;
+mod check_batch;
 mod check_response;
 mod config;
 mod execution_response;
@@ -85,6 +95,7 @@ struct Scheduler {
     max_cost_units_per_worker: u64,
     max_cost_units_per_batch: u64,
     target_entry_bytes_per_batch: u64,
+    block_engine_receiver: Option<shaq::spsc::Consumer<VerifiedMessage>>,
 }
 
 impl Scheduler {
@@ -97,6 +108,7 @@ impl Scheduler {
         max_cost_units_per_worker: u64,
         max_cost_units_per_batch: u64,
         target_entry_bytes_per_batch: u64,
+        block_engine_receiver: Option<shaq::spsc::Consumer<VerifiedMessage>>,
     ) -> Result<Self, ClientHandshakeError> {
         let ClientSession {
             allocator,
@@ -138,6 +150,7 @@ impl Scheduler {
             max_cost_units_per_batch,
             target_entry_bytes_per_batch,
             workers,
+            block_engine_receiver,
         })
     }
 
@@ -148,6 +161,7 @@ impl Scheduler {
         self.handle_slot_change();
         self.handle_check_worker_responses();
         self.handle_tpu_ingress();
+        self.handle_block_engine_ingress();
         let budget = self.pacing_budget(Instant::now(), self.scheduled_cost);
         self.schedule(budget);
         self.scheduling_details.maybe_report();
@@ -240,6 +254,7 @@ pub fn run_session(
         config.max_cost_units_per_worker,
         config.max_cost_units_per_batch,
         config.target_entry_bytes_per_batch,
+        None,
     )?;
 
     info!("Scheduler running with {worker_count} execution workers");

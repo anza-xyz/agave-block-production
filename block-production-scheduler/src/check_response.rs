@@ -1,8 +1,7 @@
 use {
     crate::{
-        Scheduler,
-        resolved_transaction::ResolvedTransaction,
-        tpu_ingress::{RawCheckBatch, TpuTransactionMeta},
+        Scheduler, check_batch::RawCheckBatch, resolved_transaction::ResolvedTransaction,
+        tpu_ingress::TpuTransactionMeta,
     },
     agave_scheduler_bindings::{
         CheckWorkerToPackMessage, SharableTransactionRegion, execution_message_flags,

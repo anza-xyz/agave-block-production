@@ -1,19 +1,16 @@
 use {
-    crate::{Scheduler, progress_tracker::SchedulerState},
-    agave_scheduler_bindings::{PackToCheckWorkerMessage, check_message_flags},
-    agave_scheduling_utils::transaction_ptr::{OwnedTransactionPtr, TransactionPtrBatch},
-    core::{mem::ManuallyDrop, num::NonZeroUsize, time::Duration},
-    rts_alloc::Allocator,
+    crate::{
+        Scheduler,
+        check_batch::{CHECK_FLAGS, dispatch_to_check},
+        progress_tracker::SchedulerState,
+    },
+    agave_scheduling_utils::transaction_ptr::OwnedTransactionPtr,
+    core::{num::NonZeroUsize, time::Duration},
 };
 
 const TPU_READABLE_TIMEOUT: Duration = Duration::from_millis(10);
 pub(super) const MAX_TPU_PACKETS_PER_ITERATION: NonZeroUsize = NonZeroUsize::new(256).unwrap();
-pub(super) const MAX_PACKETS_PER_CHECK_BATCH: usize = 16;
 const TPU_ACCEPTANCE_SLOT_WINDOW: u64 = 20;
-const CHECK_FLAGS: u16 = check_message_flags::AGE_NONCE_CHECKS
-    | check_message_flags::LOAD_FEE_PAYER_BALANCE
-    | check_message_flags::LOAD_ADDRESS_LOOKUP_TABLES
-    | check_message_flags::CALCULATE_SCHEDULING_DETAILS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -21,9 +18,6 @@ pub(super) struct TpuTransactionMeta {
     pub(super) flags: u8,
     pub(super) src_addr: [u8; 16],
 }
-
-pub(super) type RawCheckBatch<'a> =
-    TransactionPtrBatch<'a, TpuTransactionMeta, MAX_PACKETS_PER_CHECK_BATCH>;
 
 impl Scheduler {
     pub(super) fn handle_tpu_ingress(&mut self) {
@@ -40,7 +34,6 @@ impl Scheduler {
             return;
         };
 
-        let mut sent_packets = 0usize;
         let mut transactions = messages.iter().map(|message| {
             // SAFETY: Agave transfers exclusive ownership of an initialized transaction allocation.
             let transaction =
@@ -53,26 +46,26 @@ impl Scheduler {
         });
         // Stop dispatching when every possible response has a reserved queue slot.
         // Still drain the TPU batch below so ingress does not fall behind.
-        'batches: while accept_packets
-            && self.outstanding_check_batches < self.check_response_capacity
-            && transactions.len() != 0
-        {
-            let Some(mut batch) = CheckBatch::allocate(&self.allocator) else {
-                break;
-            };
-            for (transaction, metadata) in transactions.by_ref().take(MAX_PACKETS_PER_CHECK_BATCH) {
-                if !batch.try_push(transaction, metadata) {
-                    break 'batches;
-                }
-            }
-            let Some(count) = batch.try_send(&self.check_sender) else {
-                break;
-            };
-            self.outstanding_check_packets = self.outstanding_check_packets.saturating_add(count);
-            self.outstanding_check_batches = self.outstanding_check_batches.wrapping_add(1);
-            sent_packets = sent_packets.saturating_add(count);
-        }
+        let max_batches = if accept_packets {
+            self.check_response_capacity
+                .saturating_sub(self.outstanding_check_batches)
+        } else {
+            0
+        };
+        let dispatched = dispatch_to_check(
+            &self.allocator,
+            &self.check_sender,
+            CHECK_FLAGS,
+            max_batches,
+            &mut transactions,
+        );
         transactions.for_each(drop);
+        self.outstanding_check_batches = self
+            .outstanding_check_batches
+            .wrapping_add(dispatched.batches);
+        self.outstanding_check_packets = self
+            .outstanding_check_packets
+            .saturating_add(dispatched.packets);
         self.leader_slot_metrics.received_packets = self
             .leader_slot_metrics
             .received_packets
@@ -80,11 +73,11 @@ impl Scheduler {
         self.leader_slot_metrics.dropped_transactions = self
             .leader_slot_metrics
             .dropped_transactions
-            .saturating_add(messages.len().saturating_sub(sent_packets));
+            .saturating_add(messages.len().saturating_sub(dispatched.packets));
     }
 }
 
-fn should_accept_packets(state: &SchedulerState) -> bool {
+pub(super) fn should_accept_packets(state: &SchedulerState) -> bool {
     match state {
         SchedulerState::LeaderStarting { .. } | SchedulerState::LeaderReady { .. } => true,
         SchedulerState::NotLeader {
@@ -96,65 +89,20 @@ fn should_accept_packets(state: &SchedulerState) -> bool {
     }
 }
 
-/// Owns a batch container and its transactions, freeing both on drop unless sent to a queue.
-struct CheckBatch<'a> {
-    batch: ManuallyDrop<RawCheckBatch<'a>>,
-}
-
-impl<'a> CheckBatch<'a> {
-    fn allocate(allocator: &'a Allocator) -> Option<Self> {
-        RawCheckBatch::allocate(allocator).map(|batch| Self {
-            batch: ManuallyDrop::new(batch),
-        })
-    }
-
-    /// Transfers ownership to the batch, or drops the transaction if full.
-    fn try_push(&mut self, transaction: OwnedTransactionPtr<'a>, meta: TpuTransactionMeta) -> bool {
-        // SAFETY: the transaction owns initialized bytes in this allocator. On success the
-        // batch takes ownership and keeps those bytes alive.
-        if unsafe { self.batch.try_push(transaction.to_region(), meta) }.is_err() {
-            return false;
-        }
-        let _ = transaction.into_inner();
-        true
-    }
-
-    /// Returns the number of packets sent, or drops the batch on failure.
-    ///
-    /// On success, the scheduler must free the batch and transactions only after receiving
-    /// the worker response.
-    fn try_send(self, queue: &shaq::mpmc::Producer<PackToCheckWorkerMessage>) -> Option<usize> {
-        let count = self.batch.len();
-        let message = PackToCheckWorkerMessage {
-            batch: self.batch.to_sharable_transaction_batch_region(),
-            flags: CHECK_FLAGS,
-        };
-        queue.try_write(message).ok()?;
-        core::mem::forget(self);
-        Some(count)
-    }
-}
-
-impl Drop for CheckBatch<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this wrapper owns the container and its transactions. The inner batch is taken
-        // only during drop and is never accessed again.
-        let batch = unsafe { ManuallyDrop::take(&mut self.batch) };
-        // SAFETY: this wrapper exclusively owns the batch and its transaction allocations.
-        unsafe { batch.free_with_transactions() };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        crate::tests::{setup, setup_with_capacities},
+        crate::{
+            check_batch::{MAX_PACKETS_PER_CHECK_BATCH, RawCheckBatch},
+            tests::{setup, setup_with_capacities},
+        },
         agave_scheduler_bindings::{
-            CheckResponseRegion, CheckWorkerToPackMessage, SharableTransactionRegion,
-            TpuToPackMessage, processed_codes,
+            CheckResponseRegion, CheckWorkerToPackMessage, PackToCheckWorkerMessage,
+            SharableTransactionRegion, TpuToPackMessage, processed_codes,
         },
         agave_scheduler_handshake::AgaveSession,
+        rts_alloc::Allocator,
         std::time::Instant,
     };
 
